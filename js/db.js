@@ -81,7 +81,7 @@ const req = (r) => new Promise((resolve, reject) => {
 export const newId = () => (crypto.randomUUID ? crypto.randomUUID()
   : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
 
-const docRange = (docId) => IDBKeyRange.bound([docId, 0], [docId, Infinity]);
+const docRange = (docId) => IDBKeyRange.bound([docId, 0], [docId, Number.MAX_SAFE_INTEGER]);
 
 // ---- projects ----
 
