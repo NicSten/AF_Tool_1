@@ -2,7 +2,7 @@
 // Offline support: every app file is copied into the cache when the app is first
 // opened online; after that the app loads from the cache with or without signal.
 
-const CACHE = 'af-field-0c85de8c5f75';
+const CACHE = 'af-field-5f9ada453117';
 const FILES = [
   "./",
   "index.html",

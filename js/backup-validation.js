@@ -50,7 +50,6 @@ export function validateBackup(data) {
   uniqueIds(photos, 'photo');
   uniqueIds(presets, 'preset');
   const photoSequences = new Set();
-  const tags = new Set();
 
   for (const doc of docs) {
     if (doc.projectId !== data.project.id || typeof doc.name !== 'string'
@@ -66,9 +65,8 @@ export function validateBackup(data) {
       bad('invalid device record: ' + pin.id);
     if (pin.docId != null && (!docIds.has(pin.docId) || !posInt(pin.page)))
       bad('device references a nonexistent drawing/page: ' + pin.id);
-    const tag = pin.tag.trim().toLowerCase();
-    if (tags.has(tag)) bad('duplicate device tag: ' + pin.tag);
-    tags.add(tag);
+    // Duplicate tags are not rejected: projects created before tag allocation
+    // was made atomic can legitimately contain them. See renameDuplicateTags.
   }
   for (const photo of photos) {
     if (photo.projectId !== data.project.id || !pinIds.has(photo.pinId)
@@ -131,10 +129,43 @@ export function verifyBackupEntry(name, bytes, manifest) {
   const expected = manifest?.expectedSizes.get(name);
   if (expected != null && bytes.byteLength !== expected)
     bad('wrong file size for ' + name + '.');
-  if (name.startsWith('files/') && !(bytes[0] === 37 && bytes[1] === 80
-      && bytes[2] === 68 && bytes[3] === 70 && bytes[4] === 45))
+  if (name.startsWith('files/') && !hasPdfHeader(bytes))
     bad('PDF file header is invalid: ' + name);
   if ((name.startsWith('photos/') || name.startsWith('thumbs/'))
       && !(bytes[0] === 255 && bytes[1] === 216))
     bad('JPEG file header is invalid: ' + name);
+}
+
+// PDF readers (including pdf.js, which accepts drawings on import) look for
+// the %PDF- header anywhere in the first 1024 bytes, not only at offset 0.
+export function hasPdfHeader(bytes) {
+  const end = Math.min(bytes.length - 5, 1024);
+  for (let i = 0; i <= end; i++) {
+    if (bytes[i] === 37 && bytes[i + 1] === 80 && bytes[i + 2] === 68
+        && bytes[i + 3] === 70 && bytes[i + 4] === 45) return true;
+  }
+  return false;
+}
+
+// Older projects may hold the same tag on several devices (case-insensitive).
+// Keep the earliest-created device's tag and give later ones a unique suffix,
+// so such backups restore instead of being rejected. Mutates pins in place
+// and returns [{ id, from, to }] for each renamed device.
+export function renameDuplicateTags(pins) {
+  const key = (tag) => tag.trim().toLowerCase();
+  const taken = new Set(pins.map((pin) => key(pin.tag)));
+  const kept = new Set();
+  const renamed = [];
+  const ordered = [...pins].sort((a, b) => (a.created - b.created) || (a.id < b.id ? -1 : 1));
+  for (const pin of ordered) {
+    const base = pin.tag.trim();
+    if (!kept.has(key(base))) { kept.add(key(base)); continue; }
+    let n = 2, tag;
+    do tag = base + ' (' + n++ + ')'; while (taken.has(key(tag)));
+    taken.add(key(tag));
+    kept.add(key(tag));
+    renamed.push({ id: pin.id, from: pin.tag, to: tag });
+    pin.tag = tag;
+  }
+  return renamed;
 }

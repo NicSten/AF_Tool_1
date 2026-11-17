@@ -6,7 +6,7 @@ import { closePdf, openPdf } from './pdf.js';
 import { photoName } from './pins.js';
 import { csvCell } from './csv.js';
 import { needsCanvasText, rasterText, drawTextPreservingGlyphs } from './pdf-text.js';
-import { validateBackup, entryLimit, verifyBackupEntry } from './backup-validation.js';
+import { validateBackup, entryLimit, verifyBackupEntry, renameDuplicateTags } from './backup-validation.js';
 import { uniquePhotoNames } from './photo-names.js';
 import { TYPES, typeOf } from './types.js';
 import { safeName } from './ui.js';
@@ -478,7 +478,7 @@ export async function readBackup(file) {
   const stageId = db.newId();
   const seen = new Set();
   const pending = [];
-  let data = null, manifest = null, failure = null, started = false;
+  let data = null, manifest = null, failure = null, started = false, renamedTags = [];
   const unzip = new Unzip((entry) => {
     if (failure) return;
     const name = entry.name;
@@ -517,6 +517,7 @@ export async function readBackup(file) {
         catch { failure = new Error('Backup metadata (backup.json) contains invalid JSON.'); return; }
         try { manifest = validateBackup(data); }
         catch (e) { failure = e; return; }
+        renamedTags = renameDuplicateTags(data.pins);
       } else {
         try { verifyBackupEntry(name, output, manifest); }
         catch (err) { failure = err; return; }
@@ -555,7 +556,7 @@ export async function readBackup(file) {
     for (const name of manifest.required) {
       if (!seen.has(name)) throw new Error('Backup is incomplete: missing ' + name);
     }
-    return { data, stageId };
+    return { data, stageId, renamedTags };
   } catch (err) {
     await Promise.allSettled(pending);
     await db.clearRestoreStaging(stageId);

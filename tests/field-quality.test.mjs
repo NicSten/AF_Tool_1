@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { csvCell } from '../js/csv.js';
-import { validateBackup, verifyBackupEntry, entryLimit } from '../js/backup-validation.js';
+import { validateBackup, verifyBackupEntry, entryLimit, renameDuplicateTags } from '../js/backup-validation.js';
 import { needsCanvasText } from '../js/pdf-text.js';
 
 const valid = () => ({
@@ -48,7 +48,6 @@ test('malformed metadata, unexpected references and duplicates are rejected', ()
     (b) => { b.docs = {}; },
     (b) => { b.photos[0].pinId = 'unknown'; },
     (b) => { b.pins[0].docId = 'unknown'; },
-    (b) => { b.pins.push({ ...b.pins[0], id: 'pin-2', tag: 'bkr-001' }); },
     (b) => { b.docs.push({ ...b.docs[0] }); },
     (b) => { b.ink[0].strokes[0].pin = 'unknown'; },
     (b) => { b.photos[0].size = -10; },
@@ -84,4 +83,32 @@ test('camera fallback is user-click activated instead of automatic after permiss
   assert.match(pins, /this\.fileInput\.click\(\);/);
   assert.match(pins, /this\.capture\.takePhoto\(settings\)/);
   assert.doesNotMatch(pins, /catch \(err\) \{[\s\S]{0,150}this\.fileInput\.click\(\)/);
+});
+
+test('legacy duplicate device tags are restored with unique suffixes instead of rejected', () => {
+  const backup = valid();
+  backup.pins.push(
+    { ...backup.pins[0], id: 'pin-3', tag: 'BKR-001', created: 300 },
+    { ...backup.pins[0], id: 'pin-2', tag: 'bkr-001 ', created: 200 },
+    { ...backup.pins[0], id: 'pin-4', tag: 'BKR-001 (2)', created: 400 },
+  );
+  validateBackup(backup);
+  const renamed = renameDuplicateTags(backup.pins);
+  const tags = Object.fromEntries(backup.pins.map((p) => [p.id, p.tag]));
+  assert.equal(tags['pin-1'], 'BKR-001');
+  assert.equal(tags['pin-2'], 'bkr-001 (3)');
+  assert.equal(tags['pin-3'], 'BKR-001 (4)');
+  assert.equal(tags['pin-4'], 'BKR-001 (2)');
+  assert.equal(renamed.length, 2);
+  assert.equal(new Set(backup.pins.map((p) => p.tag.toLowerCase())).size, backup.pins.length);
+});
+
+test('PDFs with leading bytes before the %PDF- header (accepted by pdf.js) restore', () => {
+  const backup = valid();
+  backup.docs[0].size = 9;
+  const manifest = validateBackup(backup);
+  verifyBackupEntry('files/doc-1.pdf', new Uint8Array([0xEF,0xBB,0xBF,37,80,68,70,45,49]), manifest);
+  const late = new Uint8Array(1100); late.set([37,80,68,70,45], 1050);
+  backup.docs[0].size = 1100;
+  assert.throws(() => verifyBackupEntry('files/doc-1.pdf', late, validateBackup(backup)), /PDF file header/);
 });
