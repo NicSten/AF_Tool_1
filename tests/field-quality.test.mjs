@@ -30,7 +30,7 @@ test('spreadsheet formula cells are forced to text without breaking ordinary CSV
   assert.equal(csvCell('400 A'), '400 A');
   assert.equal(csvCell('A-10'), 'A-10');
   assert.equal(csvCell('a,"b"'), '"a,""b"""');
-  assert.equal(csvCell('=SUM(1,2)'), '"\\'=SUM(1,2)"');
+  assert.equal(csvCell('=SUM(1,2)'), `"'=SUM(1,2)"`);
 });
 
 test('valid backup metadata carries exact expected sizes and archive paths', () => {
