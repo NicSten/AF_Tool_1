@@ -5,7 +5,7 @@ import { TYPES, typeOf } from './types.js';
 import { dialog, esc, safeName, showError, toast } from './ui.js';
 
 const $ = (sel) => document.querySelector(sel);
-const PHOTO_MAX_PX = 1600;
+const PHOTO_MAX_PX = 6000; // preserve nameplate detail up to 6K on non-JPEG inputs
 const PHOTO_QUALITY = 0.82;
 
 export const missingFields = (pin) => pin.fields.filter((f) => !String(f.value ?? '').trim()).map((f) => f.name);
@@ -39,15 +39,27 @@ function applyPreset(pin, preset) {
 }
 
 async function toJpeg(source, sw, sh) {
+  if (!(sw > 0 && sh > 0)) throw new Error('The camera did not provide a valid image.');
   const k = Math.min(1, PHOTO_MAX_PX / Math.max(sw, sh));
   const canvas = document.createElement('canvas');
-  canvas.width = Math.round(sw * k);
-  canvas.height = Math.round(sh * k);
-  canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', PHOTO_QUALITY));
-  canvas.width = 0;
-  if (!blob) throw new Error('The photo could not be compressed.');
-  return blob.arrayBuffer();
+  canvas.width = Math.max(1, Math.round(sw * k));
+  canvas.height = Math.max(1, Math.round(sh * k));
+  try {
+    canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', PHOTO_QUALITY));
+    if (!blob) throw new Error('The photo could not be compressed.');
+    return blob.arrayBuffer();
+  } finally {
+    canvas.width = canvas.height = 0;
+  }
+}
+
+async function photoBytes(blob) {
+  // Keep the full sensor JPEG for readable equipment/nameplate text.
+  if (/^image\/jpe?g$/i.test(blob.type)) return blob.arrayBuffer();
+  const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+  try { return await toJpeg(bitmap, bitmap.width, bitmap.height); }
+  finally { bitmap.close(); }
 }
 
 // ---------------------------------------------------------------- camera
@@ -57,63 +69,170 @@ class Camera {
     this.dlg = $('#camera');
     this.video = $('#camera-video');
     this.fileInput = $('#camera-file');
-    $('#camera-shoot').addEventListener('click', () => this._shoot());
+    this.help = $('#camera-help');
+    this.useApp = $('#camera-use-app');
+    this.torchButton = $('#camera-torch');
+    this.zoomControl = $('#camera-zoom');
+    this.zoomLabel = $('#camera-zoom-label');
+    this.shootButton = $('#camera-shoot');
+    this.shootButton.addEventListener('click', () => this._shoot());
     $('#camera-done').addEventListener('click', () => this.dlg.close());
     this.dlg.addEventListener('close', () => this._stop());
+
+    // Must run directly inside this click handler. Clicking the hidden input
+    // after an awaited permission prompt loses user activation on Android.
+    this.useApp.addEventListener('click', () => {
+      this._stop();
+      this._fallback('Use your tablet camera or choose an existing image.');
+      this.fileInput.click();
+    });
+    this.torchButton.addEventListener('click', async () => {
+      if (!this.track) return;
+      const next = !this.torchOn;
+      try {
+        await this.track.applyConstraints({ advanced: [{ torch: next }] });
+        this.torchOn = next;
+        this.torchButton.setAttribute('aria-pressed', String(next));
+        this.torchButton.textContent = next ? 'Light on' : 'Light off';
+      } catch (err) { showError(err, 'Camera light unavailable'); }
+    });
+    this.zoomControl.addEventListener('input', async () => {
+      if (!this.track) return;
+      try {
+        await this.track.applyConstraints({ advanced: [{ zoom: Number(this.zoomControl.value) }] });
+      } catch (err) { showError(err, 'Camera zoom unavailable'); }
+    });
+
     this.fileInput.addEventListener('change', async () => {
       const file = this.fileInput.files[0];
       this.fileInput.value = '';
       if (!file) return;
       try {
-        const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
-        await this.onPhoto(await toJpeg(bitmap, bitmap.width, bitmap.height));
-        bitmap.close();
-      } catch (err) {
-        showError(err, 'Photo not saved');
-      }
+        if (file.type && !file.type.startsWith('image/')) throw new Error('Select a photo file.');
+        await this.onPhoto(await photoBytes(file));
+        this.count++;
+        this._updateCount();
+      } catch (err) { showError(err, 'Photo not saved'); }
     });
   }
 
-  // onPhoto(buffer) is called for every picture taken; the camera stays open for more.
+  _updateCount() { $('#camera-count').textContent = this.count ? this.count + ' taken' : ''; }
+
+  _fallback(message) {
+    this.video.hidden = true;
+    this.shootButton.hidden = true;
+    this.help.hidden = false;
+    this.help.textContent = message;
+    this.torchButton.hidden = true;
+    this.zoomLabel.hidden = true;
+  }
+
+  // onPhoto(buffer) is called after each image; the dialog remains available.
   async open(onPhoto) {
     this.onPhoto = onPhoto;
     this.count = 0;
-    $('#camera-count').textContent = '';
+    this._updateCount();
+    this.help.hidden = false;
+    this.help.textContent = 'Requesting camera access…';
+    this.video.hidden = true;
+    this.shootButton.hidden = true;
+    this.torchButton.hidden = true;
+    this.zoomLabel.hidden = true;
+    this.useApp.hidden = false;
+    const token = this.token = (this.token || 0) + 1;
+    if (!this.dlg.open) this.dlg.showModal();
     try {
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error('no camera API');
-      this.stream = await navigator.mediaDevices.getUserMedia({
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera API not available.');
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1440 } },
       });
+      if (token !== this.token || !this.dlg.open) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      this.stream = stream;
+      this.track = stream.getVideoTracks()[0];
+      this.capture = null;
+      if (typeof ImageCapture !== 'undefined' && this.track) {
+        try { this.capture = new ImageCapture(this.track); }
+        catch (err) { console.warn('Still capture unavailable; using preview frames.', err); }
+      }
+      this.video.srcObject = stream;
+      this.video.hidden = false;
+      this.shootButton.hidden = false;
+      this.help.hidden = true;
+      await this.video.play();
+      await this._configureControls().catch((err) => console.warn('Camera controls unavailable', err));
     } catch (err) {
-      // No permission or no camera API: fall back to the tablet's own camera app.
       console.warn('In-app camera unavailable', err);
-      this.fileInput.click();
-      return;
+      if (token !== this.token || !this.dlg.open) return;
+      this._stop();
+      this._fallback('The in-app camera is unavailable. Tap "Use camera app" to take or select a photo.');
     }
-    this.video.srcObject = this.stream;
-    this.dlg.showModal();
-    await this.video.play().catch(() => {});
+  }
+
+  async _configureControls() {
+    const capabilities = this.track?.getCapabilities?.() || {};
+    this.torchOn = false;
+    if (capabilities.torch === true) {
+      this.torchButton.hidden = false;
+      this.torchButton.textContent = 'Light off';
+      this.torchButton.setAttribute('aria-pressed', 'false');
+    }
+    if (capabilities.zoom && capabilities.zoom.max > capabilities.zoom.min) {
+      this.zoomLabel.hidden = false;
+      this.zoomControl.min = String(capabilities.zoom.min);
+      this.zoomControl.max = String(capabilities.zoom.max);
+      this.zoomControl.step = String(capabilities.zoom.step || 0.1);
+      this.zoomControl.value = String(this.track.getSettings?.().zoom ?? capabilities.zoom.min);
+    }
   }
 
   async _shoot() {
+    if (this.shooting || !this.stream) return;
+    this.shooting = true;
+    this.shootButton.disabled = true;
     const v = this.video;
-    if (!v.videoWidth) return;
     v.classList.add('flash');
     setTimeout(() => v.classList.remove('flash'), 120);
     try {
-      await this.onPhoto(await toJpeg(v, v.videoWidth, v.videoHeight));
+      let bytes = null;
+      if (this.capture?.takePhoto) {
+        try {
+          const settings = {};
+          if (this.capture.getPhotoCapabilities) {
+            const cap = await this.capture.getPhotoCapabilities();
+            if (cap.imageWidth?.max) settings.imageWidth = cap.imageWidth.max;
+            if (cap.imageHeight?.max) settings.imageHeight = cap.imageHeight.max;
+          }
+          bytes = await photoBytes(await this.capture.takePhoto(settings));
+        } catch (err) {
+          console.warn('Full-resolution still capture failed; using video frame.', err);
+        }
+      }
+      if (!bytes) {
+        if (!v.videoWidth) throw new Error('Camera preview is not ready.');
+        bytes = await toJpeg(v, v.videoWidth, v.videoHeight);
+      }
+      await this.onPhoto(bytes);
       this.count++;
-      $('#camera-count').textContent = `${this.count} taken`;
-    } catch (err) {
-      showError(err, 'Photo not saved');
+      this._updateCount();
+    } catch (err) { showError(err, 'Photo not saved'); }
+    finally {
+      this.shooting = false;
+      this.shootButton.disabled = false;
     }
   }
 
   _stop() {
-    this.stream?.getTracks().forEach((t) => t.stop());
+    this.token = (this.token || 0) + 1;
+    this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
+    this.track = null;
+    this.capture = null;
     this.video.srcObject = null;
+    this.torchOn = false;
   }
 }
 

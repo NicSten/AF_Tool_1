@@ -594,3 +594,10 @@ dialog h3 { margin: 16px 0 8px; font-size: 16px; text-transform: uppercase; lett
   box-shadow: 0 10px 32px rgba(0, 0, 0, .6);
 }
 .update-banner span { flex: 1 1 220px; }
+
+/* Native camera fallback is always a deliberate tap, preserving user activation. */
+.camera-help { margin: auto 20px; text-align: center; color: var(--text); }
+.camera-settings { display: flex; flex: none; gap: 10px; flex-wrap: wrap; padding: 8px 16px; background: var(--surface); align-items: center; }
+.camera-settings .btn { height: 44px; }
+.camera-settings label { display: inline-flex; align-items: center; gap: 8px; }
+.camera-settings input[type="range"] { width: min(140px, 25vw); }

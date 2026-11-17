@@ -4,6 +4,9 @@
 import * as db from './db.js';
 import { closePdf, openPdf } from './pdf.js';
 import { photoName } from './pins.js';
+import { csvCell } from './csv.js';
+import { needsCanvasText, rasterText, drawTextPreservingGlyphs } from './pdf-text.js';
+import { validateBackup, entryLimit, verifyBackupEntry, renameDuplicateTags } from './backup-validation.js';
 import { uniquePhotoNames } from './photo-names.js';
 import { TYPES, typeOf } from './types.js';
 import { safeName } from './ui.js';
@@ -103,11 +106,6 @@ function uniqueNamer() {
 
 // ---------------------------------------------------------------- csv
 
-const csvCell = (v) => {
-  const s = String(v ?? '');
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-};
-
 function csvFor(pins, docById, photosByPin, photoNames) {
   const fieldNames = [];
   for (const pin of pins) for (const f of pin.fields) if (!fieldNames.includes(f.name)) fieldNames.push(f.name);
@@ -176,12 +174,12 @@ function pinGeometry(pin, size, textWidth) {
   return { r: size * 0.5, box, textX: box.x + size * 0.45, textY: box.y + size * 1.08 };
 }
 
-function pinOps(pin, size, font, fontKey) {
+function pinOps(pin, size, font, fontKey, widthOverride = null, skipText = false) {
   const text = latin(pin.tag);
-  const { r, box, textX, textY } = pinGeometry(pin, size, font.widthOfTextAtSize(text, size));
+  const { r, box, textX, textY } = pinGeometry(pin, size, widthOverride ?? font.widthOfTextAtSize(text, size));
   const k = 0.5523 * r;
   const { x, y } = pin;
-  return [
+  const ops = [
     PDF.setFillingColor(hexColor(typeOf(pin.type).color)),
     PDF.setStrokingColor(PDF.rgb(1, 1, 1)),
     PDF.setLineWidth(size * 0.12),
@@ -193,13 +191,16 @@ function pinOps(pin, size, font, fontKey) {
     PDF.closePath(), PDF.fillAndStroke(),
     PDF.moveTo(box.x, box.y), PDF.lineTo(box.x + box.w, box.y), PDF.lineTo(box.x + box.w, box.y + box.h),
     PDF.lineTo(box.x, box.y + box.h), PDF.closePath(), PDF.fillAndStroke(),
+  ];
+  if (!skipText) ops.push(
     PDF.beginText(),
     PDF.setFontAndSize(fontKey, size),
     PDF.setFillingColor(PDF.rgb(1, 1, 1)),
-    PDF.setTextMatrix(1, 0, 0, -1, textX, textY),     // flip back: page space here has y pointing down
+    PDF.setTextMatrix(1, 0, 0, -1, textX, textY),
     PDF.showText(font.encodeText(text)),
     PDF.endText(),
-  ];
+  );
+  return ops;
 }
 
 // Draws ink and pin tags straight into the original PDF, so the drawing stays vector.
@@ -223,7 +224,24 @@ async function annotateVector(out, jsPdf, inkByPage, pinsByPage) {
     if (pins.length) {
       const fontKey = page.node.newFontDictionary('AFTag', font.ref);
       const size = tagSize(viewport.width, viewport.height);
-      for (const pin of pins) ops.push(...pinOps(pin, size, font, fontKey));
+      for (const pin of pins) {
+        const unicode = needsCanvasText(pin.tag);
+        if (!unicode) {
+          ops.push(...pinOps(pin, size, font, fontKey));
+          continue;
+        }
+        const glyphs = await rasterText(out, pin.tag, { size, bold: true });
+        ops.push(...pinOps(pin, size, font, fontKey, glyphs.width, true));
+        const { textX, textY } = pinGeometry(pin, size, glyphs.width);
+        const key = page.node.newXObject('AFUnicode', glyphs.image.ref);
+        ops.push(
+          PDF.pushGraphicsState(),
+          PDF.concatTransformationMatrix(glyphs.width, 0, 0, -glyphs.height,
+            textX, textY - glyphs.baseline + glyphs.height),
+          PDF.drawObject(key),
+          PDF.popGraphicsState(),
+        );
+      }
     }
     ops.push(PDF.popGraphicsState());
     page.pushOperators(...ops);
@@ -301,8 +319,8 @@ async function addPhotoIndex(out, title, subtitle, entries) {
     const slot = i % perPage;
     if (slot === 0) {
       const page = out.addPage([W, H]);
-      page.drawText(latin(title), { x: M, y: H - M - 16, size: 16, font: bold, color: black });
-      page.drawText(latin(`${subtitle}  ·  page ${i / perPage + 1} of ${pageCount}`), { x: M, y: H - M - 32, size: 9, font: regular, color: grey });
+      await drawTextPreservingGlyphs(out, page, title, { x: M, y: H - M - 16, size: 16, font: bold, color: black, bold: true }, latin);
+      await drawTextPreservingGlyphs(out, page, `${subtitle}  ·  page ${i / perPage + 1} of ${pageCount}`, { x: M, y: H - M - 32, size: 9, font: regular, color: grey, colorName: 'grey' }, latin);
     }
     const page = out.getPage(out.getPageCount() - 1);
     const { pin, name, data } = entries[i];
@@ -313,10 +331,10 @@ async function addPhotoIndex(out, title, subtitle, entries) {
     const k = Math.min(cellW / image.width, boxH / image.height);
     const w = image.width * k, h = image.height * k;
     page.drawImage(image, { x: x + (cellW - w) / 2, y: top - boxH + (boxH - h) / 2, width: w, height: h });
-    page.drawText(latin(name), { x, y: top - boxH - 12, size: 9, font: bold, color: black });
+    await drawTextPreservingGlyphs(out, page, name, { x, y: top - boxH - 12, size: 9, font: bold, color: black, bold: true, maxWidth: cellW }, latin);
     const where = pin.page ? `page ${pin.page}` : 'not on a drawing';
     const detail = [pin.tag, pin.presetName || typeOf(pin.type).label, where].join('  ·  ');
-    page.drawText(latin(detail), { x, y: top - boxH - 23, size: 8, font: regular, color: grey, maxWidth: cellW });
+    await drawTextPreservingGlyphs(out, page, detail, { x, y: top - boxH - 23, size: 8, font: regular, color: grey, maxWidth: cellW, colorName: 'grey' }, latin);
   }
 }
 
@@ -452,48 +470,7 @@ export async function backupProject(projectId, setStatus = () => {}, { writable 
 }
 
 
-// Validate the metadata before writing any device/project record.
-// A broken or unrelated ZIP produces an actionable error, not a TypeError.
-function validateBackup(data) {
-  if (!data || data.format !== BACKUP_FORMAT || !data.project?.id || typeof data.project.name !== 'string') {
-    throw new Error('That ZIP is not an AF Field backup.');
-  }
-  if (!Number.isInteger(data.version) || data.version < 1) throw new Error('Backup format version is missing or invalid.');
-  if (data.version > BACKUP_VERSION) throw new Error('This backup is from a newer app version. Update the app first.');
-  if (!Number.isFinite(data.project.updated)) throw new Error('Backup has invalid project metadata.');
-  for (const field of ['docs', 'ink', 'pins', 'photos', 'presets']) {
-    if (!Array.isArray(data[field])) throw new Error('Backup metadata is invalid: missing ' + field + ' list.');
-  }
-  const idOK = (id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
-  if (!idOK(data.project.id)) throw new Error('Backup contains an invalid project ID.');
-  for (const doc of data.docs) {
-    if (!idOK(doc?.id) || typeof doc.name !== 'string' || doc.projectId !== data.project.id)
-      throw new Error('Backup contains an invalid drawing record.');
-  }
-  for (const photo of data.photos) {
-    if (!idOK(photo?.id) || !idOK(photo.pinId) || photo.projectId !== data.project.id)
-      throw new Error('Backup contains an invalid photo record.');
-  }
-  for (const pin of data.pins) {
-    if (!idOK(pin?.id) || pin.projectId !== data.project.id || !Array.isArray(pin.fields))
-      throw new Error('Backup contains an invalid device record.');
-  }
-  for (const entry of data.ink) {
-    if (!idOK(entry?.docId) || !Number.isInteger(entry.page) || !Array.isArray(entry.strokes))
-      throw new Error('Backup contains an invalid ink record.');
-  }
-  for (const preset of data.presets) if (!idOK(preset?.id))
-    throw new Error('Backup contains an invalid preset.');
-  const required = new Set(['backup.json']);
-  const allowed = new Set(required);
-  for (const doc of data.docs) {
-    required.add('files/' + doc.id + '.pdf');
-    allowed.add('thumbs/' + doc.id + '.jpg');
-  }
-  for (const photo of data.photos) required.add('photos/' + photo.id + '.jpg');
-  for (const name of required) allowed.add(name);
-  return { required, allowed };
-}
+// Metadata validation is provided by the separately tested backup-validation module.
 
 // Unzip incrementally. Store one finished PDF/photo at a time in a temporary
 // IndexedDB store instead of retaining the entire expanded archive in RAM.
@@ -501,7 +478,7 @@ export async function readBackup(file) {
   const stageId = db.newId();
   const seen = new Set();
   const pending = [];
-  let data = null, manifest = null, failure = null, started = false;
+  let data = null, manifest = null, failure = null, started = false, renamedTags = [];
   const unzip = new Unzip((entry) => {
     if (failure) return;
     const name = entry.name;
@@ -514,6 +491,10 @@ export async function readBackup(file) {
       failure = new Error('Invalid backup: unexpected or repeated archive file ' + name);
       return;
     }
+    if (entry.originalSize != null && entry.originalSize > entryLimit(name)) {
+      failure = new Error('Backup validation failed: archive entry is too large: ' + name);
+      return;
+    }
     const chunks = [];
     let length = 0;
     entry.ondata = (err, bytes, final) => {
@@ -521,8 +502,8 @@ export async function readBackup(file) {
       if (failure) return;
       if (bytes?.length) {
         length += bytes.length;
-        if (name === 'backup.json' && length > 32 * 1024 * 1024) {
-          failure = new Error('Backup metadata is unreasonably large.');
+        if (length > entryLimit(name)) {
+          failure = new Error('Backup validation failed: oversized archive entry: ' + name);
           return;
         }
         chunks.push(bytes.slice());
@@ -536,7 +517,10 @@ export async function readBackup(file) {
         catch { failure = new Error('Backup metadata (backup.json) contains invalid JSON.'); return; }
         try { manifest = validateBackup(data); }
         catch (e) { failure = e; return; }
+        renamedTags = renameDuplicateTags(data.pins);
       } else {
+        try { verifyBackupEntry(name, output, manifest); }
+        catch (err) { failure = err; return; }
         const m = /^(files|photos|thumbs)\/([A-Za-z0-9_-]+)\.(pdf|jpg)$/.exec(name);
         if (!m) { failure = new Error('Backup has an invalid archive path.'); return; }
         const [, kind, id] = m;
@@ -572,7 +556,7 @@ export async function readBackup(file) {
     for (const name of manifest.required) {
       if (!seen.has(name)) throw new Error('Backup is incomplete: missing ' + name);
     }
-    return { data, stageId };
+    return { data, stageId, renamedTags };
   } catch (err) {
     await Promise.allSettled(pending);
     await db.clearRestoreStaging(stageId);

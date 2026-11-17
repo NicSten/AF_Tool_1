@@ -93,7 +93,10 @@ $('#restore-input').addEventListener('change', guard(async (e) => {
   try {
     const { project, docs, pins, exported } = backup.data;
     const existing = await db.getProject(project.id);
-    const summary = `${plural(docs.length, 'drawing')} and ${plural(pins.length, 'device')}, backed up ${fmtDateTime(exported)}.`;
+    const renamed = backup.renamedTags?.length
+      ? ` ${plural(backup.renamedTags.length, 'device')} shared a tag with another device and will be renamed (for example ${backup.renamedTags[0].from} → ${backup.renamedTags[0].to}).`
+      : '';
+    const summary = `${plural(docs.length, 'drawing')} and ${plural(pins.length, 'device')}, backed up ${fmtDateTime(exported)}.${renamed}`;
     const yes = await dialog(existing ? {
       title: `Replace “${existing.name}”?`,
       body: `This project is already on this tablet. Restoring replaces it with the backup: ${summary} Anything added since that backup will be lost.`,
