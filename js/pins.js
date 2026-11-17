@@ -108,7 +108,7 @@ class Camera {
       this.fileInput.value = '';
       if (!file) return;
       try {
-        if (!file.type.startsWith('image/')) throw new Error('Select a photo file.');
+        if (file.type && !file.type.startsWith('image/')) throw new Error('Select a photo file.');
         await this.onPhoto(await photoBytes(file));
         this.count++;
         this._updateCount();
@@ -153,14 +153,17 @@ class Camera {
       }
       this.stream = stream;
       this.track = stream.getVideoTracks()[0];
-      this.capture = (typeof ImageCapture !== 'undefined' && this.track)
-        ? new ImageCapture(this.track) : null;
+      this.capture = null;
+      if (typeof ImageCapture !== 'undefined' && this.track) {
+        try { this.capture = new ImageCapture(this.track); }
+        catch (err) { console.warn('Still capture unavailable; using preview frames.', err); }
+      }
       this.video.srcObject = stream;
       this.video.hidden = false;
       this.shootButton.hidden = false;
       this.help.hidden = true;
       await this.video.play();
-      await this._configureControls();
+      await this._configureControls().catch((err) => console.warn('Camera controls unavailable', err));
     } catch (err) {
       console.warn('In-app camera unavailable', err);
       if (token !== this.token || !this.dlg.open) return;
