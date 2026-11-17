@@ -82,3 +82,47 @@ export function download(blob, name) {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
+
+// Present the prepared archive through a fresh user click. Mobile browsers
+// require that navigator.share() and anchor.click() run in that click handler.
+// A successful share/download attempt is NOT proof the recipient kept the file.
+export function offerFile(blob, name) {
+  const file = new File([blob], name, { type: 'application/zip' });
+  let canShare = typeof navigator.share === 'function';
+  if (canShare && navigator.canShare) {
+    try { canShare = navigator.canShare({ files: [file] }); }
+    catch { canShare = false; }
+  }
+  const dlg = document.createElement('dialog');
+  dlg.innerHTML = `
+    <h2>Save or share archive</h2>
+    <p>Choose where to store <strong>${esc(name)}</strong>. For backups, keeping a copy in cloud storage or on another device is recommended.</p>
+    <div class="dialog-actions" style="flex-wrap:wrap">
+      ${canShare ? '<button type="button" class="btn primary" data-save="share">Share / Save to…</button>' : ''}
+      <button type="button" class="btn" data-save="download">Download</button>
+      <button type="button" class="btn" data-save="cancel">Cancel</button>
+    </div>`;
+  document.body.append(dlg);
+  return new Promise((resolve) => {
+    const finish = (method) => {
+      dlg.close();
+      dlg.remove();
+      resolve(method);
+    };
+    dlg.querySelector('[data-save="share"]')?.addEventListener('click', async () => {
+      try {
+        await navigator.share({ files: [file], title: name });
+        finish('share');
+      } catch (err) {
+        if (err?.name !== 'AbortError') showError(err, 'Share failed');
+      }
+    });
+    dlg.querySelector('[data-save="download"]').addEventListener('click', () => {
+      download(blob, name);
+      finish('download');
+    });
+    dlg.querySelector('[data-save="cancel"]').addEventListener('click', () => finish(null));
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); finish(null); });
+    dlg.showModal();
+  });
+}
