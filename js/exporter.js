@@ -586,4 +586,3 @@ export async function restoreBackup({ data, stageId }) {
   }
 }
 
- and checks it before anything on the device is touched.
