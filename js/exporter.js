@@ -4,6 +4,7 @@
 import * as db from './db.js';
 import { closePdf, openPdf } from './pdf.js';
 import { photoName } from './pins.js';
+import { uniquePhotoNames } from './photo-names.js';
 import { TYPES, typeOf } from './types.js';
 import { safeName } from './ui.js';
 import { pathOf } from './viewer.js';
@@ -59,7 +60,7 @@ const csvCell = (v) => {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-function csvFor(pins, docById, photosByPin) {
+function csvFor(pins, docById, photosByPin, photoNames) {
   const fieldNames = [];
   for (const pin of pins) for (const f of pin.fields) if (!fieldNames.includes(f.name)) fieldNames.push(f.name);
   const rows = [['Tag', 'Drawing', 'Page', 'Preset', ...fieldNames, 'Notes', 'Photos']];
@@ -69,7 +70,7 @@ function csvFor(pins, docById, photosByPin) {
       pin.tag, docById.get(pin.docId)?.name ?? '', pin.page ?? '', pin.presetName,
       ...fieldNames.map((name) => values.get(name) ?? ''),
       pin.notes,
-      (photosByPin.get(pin.id) || []).map((p) => photoName(pin, p)).join('; '),
+      (photosByPin.get(pin.id) || []).map((p) => photoNames.get(p.id)).join('; '),
     ]);
   }
   // BOM so Excel reads UTF-8; CRLF line ends per RFC 4180.
@@ -321,16 +322,19 @@ export async function exportProject(projectId, setStatus = () => {}, { forceRast
     if (!photosByPin.has(photo.pinId)) photosByPin.set(photo.pinId, []);
     photosByPin.get(photo.pinId).push(photo);
   }
+  // Generate each sanitized filename once. ZIP entries, CSV references, and
+  // annotated PDF indexes must all use the same collision-free map.
+  const photoNames = uniquePhotoNames(pins, photosByPin, photoName);
   const zip = zipWriter();
 
   setStatus('Writing device tables…');
   for (const type of TYPES) {
     const ofType = pins.filter((p) => p.type === type.id);
-    if (ofType.length) zip.add(`csv/${type.label}.csv`, csvFor(ofType, docById, photosByPin), true);
+    if (ofType.length) zip.add(`csv/${type.label}.csv`, csvFor(ofType, docById, photosByPin, photoNames), true);
   }
 
   const photoEntries = (list) => list.flatMap((pin) => (photosByPin.get(pin.id) || []).map((photo) => ({
-    pin, name: photoName(pin, photo), data: () => db.getPhotoData(photo.id),
+    pin, name: photoNames.get(photo.id), data: () => db.getPhotoData(photo.id),
   })));
   const allPhotos = photoEntries(pins);
   for (const [i, entry] of allPhotos.entries()) {
