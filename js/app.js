@@ -471,8 +471,34 @@ async function updateStatus() {
 }
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').catch((err) => console.warn('Service worker failed', err));
-  navigator.serviceWorker.addEventListener('controllerchange', updateStatus);
+  let reloadForUpdate = false;
+  const updateBanner = $('#update-banner');
+  const offerUpdate = (registration) => {
+    if (!registration.waiting || !navigator.serviceWorker.controller) return;
+    updateBanner.hidden = false;
+    $('#update-reload').onclick = () => {
+      if (!registration.waiting) return;
+      reloadForUpdate = true;
+      $('#update-reload').disabled = true;
+      registration.waiting.postMessage({ type: 'ACTIVATE_UPDATE' });
+    };
+    $('#update-later').onclick = () => { updateBanner.hidden = true; };
+  };
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (reloadForUpdate) location.reload();
+    else updateStatus();
+  });
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then((registration) => {
+    offerUpdate(registration); // an update might already be waiting
+    registration.addEventListener('updatefound', () => {
+      const installing = registration.installing;
+      installing?.addEventListener('statechange', () => {
+        if (installing.state === 'installed') offerUpdate(registration);
+      });
+    });
+    // Check on app launch, including when the Android PWA was left installed.
+    if (navigator.onLine) registration.update().catch((err) => console.warn('Update check failed', err));
+  }).catch((err) => console.warn('Service worker failed', err));
 }
 
 // Ask the browser not to evict our data under storage pressure.

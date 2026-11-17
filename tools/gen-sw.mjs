@@ -31,13 +31,28 @@ const FILES = ${JSON.stringify(['./', ...files], null, 2)};
 
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
+    // Build a completely NEW cache. A failed download must never replace
+    // the active worker or leave a partially populated cache selected.
     const cache = await caches.open(CACHE);
-    // Small batches so a slow connection is not hit with 200 requests at once.
-    for (let i = 0; i < FILES.length; i += 12) {
-      await cache.addAll(FILES.slice(i, i + 12).map((url) => new Request(url, { cache: 'reload' })));
+    try {
+      for (let i = 0; i < FILES.length; i += 12) {
+        await cache.addAll(FILES.slice(i, i + 12).map(
+          (url) => new Request(url, { cache: 'reload' }),
+        ));
+      }
+    } catch (err) {
+      await caches.delete(CACHE);
+      throw err;
     }
-    await self.skipWaiting();
+    // Do NOT skipWaiting here. Existing pages continue with their old cache.
   })());
+});
+
+// The active page asks for activation only after the user chooses Reload.
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'ACTIVATE_UPDATE') {
+    event.waitUntil(self.skipWaiting());
+  }
 });
 
 self.addEventListener('activate', (event) => {
@@ -52,24 +67,18 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const request = event.request;
   const url = new URL(request.url);
-  if (request.method !== 'GET' || url.origin !== location.origin) return;
+  if (request.method !== 'GET' || url.origin !== location.origin
+      || !url.href.startsWith(self.registration.scope)) return;
   event.respondWith((async () => {
     const cache = await caches.open(CACHE);
-    const cached = await cache.match(request.mode === 'navigate' ? './' : request, { ignoreSearch: true });
-    // Third-party library files never change; app files are refreshed in the
-    // background when there is signal, so a new deploy shows up on the next launch.
-    const refresh = !url.pathname.includes('/vendor/');
-    if (cached && !refresh) return cached;
-    const network = fetch(request).then((response) => {
-      if (response.ok && request.mode !== 'navigate') cache.put(request, response.clone());
-      else if (response.ok) cache.put('./', response.clone());
-      return response;
-    });
-    if (!cached) return network;
-    event.waitUntil(network.catch(() => {}));
-    return cached;
+    const cached = await cache.match(request.mode === 'navigate' ? './' : request,
+      { ignoreSearch: true });
+    // Cache-first for ALL app files. Never overwrite a running version with
+    // independent background requests for a different deployment.
+    return cached || fetch(request);
   })());
 });
+
 `;
 
 writeFileSync(join(root, 'sw.js'), sw);
