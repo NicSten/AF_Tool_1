@@ -5,6 +5,7 @@ import * as db from './db.js';
 import { closePdf, openPdf } from './pdf.js';
 import { photoName } from './pins.js';
 import { csvCell } from './csv.js';
+import { needsCanvasText, rasterText, drawTextPreservingGlyphs } from './pdf-text.js';
 import { validateBackup, entryLimit, verifyBackupEntry } from './backup-validation.js';
 import { uniquePhotoNames } from './photo-names.js';
 import { TYPES, typeOf } from './types.js';
@@ -173,12 +174,12 @@ function pinGeometry(pin, size, textWidth) {
   return { r: size * 0.5, box, textX: box.x + size * 0.45, textY: box.y + size * 1.08 };
 }
 
-function pinOps(pin, size, font, fontKey) {
+function pinOps(pin, size, font, fontKey, widthOverride = null, skipText = false) {
   const text = latin(pin.tag);
-  const { r, box, textX, textY } = pinGeometry(pin, size, font.widthOfTextAtSize(text, size));
+  const { r, box, textX, textY } = pinGeometry(pin, size, widthOverride ?? font.widthOfTextAtSize(text, size));
   const k = 0.5523 * r;
   const { x, y } = pin;
-  return [
+  const ops = [
     PDF.setFillingColor(hexColor(typeOf(pin.type).color)),
     PDF.setStrokingColor(PDF.rgb(1, 1, 1)),
     PDF.setLineWidth(size * 0.12),
@@ -190,13 +191,16 @@ function pinOps(pin, size, font, fontKey) {
     PDF.closePath(), PDF.fillAndStroke(),
     PDF.moveTo(box.x, box.y), PDF.lineTo(box.x + box.w, box.y), PDF.lineTo(box.x + box.w, box.y + box.h),
     PDF.lineTo(box.x, box.y + box.h), PDF.closePath(), PDF.fillAndStroke(),
+  ];
+  if (!skipText) ops.push(
     PDF.beginText(),
     PDF.setFontAndSize(fontKey, size),
     PDF.setFillingColor(PDF.rgb(1, 1, 1)),
-    PDF.setTextMatrix(1, 0, 0, -1, textX, textY),     // flip back: page space here has y pointing down
+    PDF.setTextMatrix(1, 0, 0, -1, textX, textY),
     PDF.showText(font.encodeText(text)),
     PDF.endText(),
-  ];
+  );
+  return ops;
 }
 
 // Draws ink and pin tags straight into the original PDF, so the drawing stays vector.
@@ -220,7 +224,24 @@ async function annotateVector(out, jsPdf, inkByPage, pinsByPage) {
     if (pins.length) {
       const fontKey = page.node.newFontDictionary('AFTag', font.ref);
       const size = tagSize(viewport.width, viewport.height);
-      for (const pin of pins) ops.push(...pinOps(pin, size, font, fontKey));
+      for (const pin of pins) {
+        const unicode = needsCanvasText(pin.tag);
+        if (!unicode) {
+          ops.push(...pinOps(pin, size, font, fontKey));
+          continue;
+        }
+        const glyphs = await rasterText(out, pin.tag, { size, bold: true });
+        ops.push(...pinOps(pin, size, font, fontKey, glyphs.width, true));
+        const { textX, textY } = pinGeometry(pin, size, glyphs.width);
+        const key = page.node.newXObject('AFUnicode', glyphs.image.ref);
+        ops.push(
+          PDF.pushGraphicsState(),
+          PDF.concatTransformationMatrix(glyphs.width, 0, 0, -glyphs.height,
+            textX, textY - glyphs.baseline + glyphs.height),
+          PDF.drawObject(key),
+          PDF.popGraphicsState(),
+        );
+      }
     }
     ops.push(PDF.popGraphicsState());
     page.pushOperators(...ops);
@@ -298,8 +319,8 @@ async function addPhotoIndex(out, title, subtitle, entries) {
     const slot = i % perPage;
     if (slot === 0) {
       const page = out.addPage([W, H]);
-      page.drawText(latin(title), { x: M, y: H - M - 16, size: 16, font: bold, color: black });
-      page.drawText(latin(`${subtitle}  ·  page ${i / perPage + 1} of ${pageCount}`), { x: M, y: H - M - 32, size: 9, font: regular, color: grey });
+      await drawTextPreservingGlyphs(out, page, title, { x: M, y: H - M - 16, size: 16, font: bold, color: black, bold: true }, latin);
+      await drawTextPreservingGlyphs(out, page, `${subtitle}  ·  page ${i / perPage + 1} of ${pageCount}`, { x: M, y: H - M - 32, size: 9, font: regular, color: grey, colorName: 'grey' }, latin);
     }
     const page = out.getPage(out.getPageCount() - 1);
     const { pin, name, data } = entries[i];
@@ -310,10 +331,10 @@ async function addPhotoIndex(out, title, subtitle, entries) {
     const k = Math.min(cellW / image.width, boxH / image.height);
     const w = image.width * k, h = image.height * k;
     page.drawImage(image, { x: x + (cellW - w) / 2, y: top - boxH + (boxH - h) / 2, width: w, height: h });
-    page.drawText(latin(name), { x, y: top - boxH - 12, size: 9, font: bold, color: black });
+    await drawTextPreservingGlyphs(out, page, name, { x, y: top - boxH - 12, size: 9, font: bold, color: black, bold: true, maxWidth: cellW }, latin);
     const where = pin.page ? `page ${pin.page}` : 'not on a drawing';
     const detail = [pin.tag, pin.presetName || typeOf(pin.type).label, where].join('  ·  ');
-    page.drawText(latin(detail), { x, y: top - boxH - 23, size: 8, font: regular, color: grey, maxWidth: cellW });
+    await drawTextPreservingGlyphs(out, page, detail, { x, y: top - boxH - 23, size: 8, font: regular, color: grey, maxWidth: cellW, colorName: 'grey' }, latin);
   }
 }
 
