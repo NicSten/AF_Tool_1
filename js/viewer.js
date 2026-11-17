@@ -566,6 +566,15 @@ export class Viewer {
         this.pins = this.pins.filter((p) => p.id !== pinId);
         if (pin && pin.docId === doc.id) this.pins.push(pin);
         this._renderPins();
+        if (!pin && this.page) {
+          const page = this.pageNum;
+          db.getInk(doc.id, page).then((strokes) => {
+            if (this.doc !== doc || this.pageNum !== page) return;
+            this.strokes = strokes;
+            this._setSelection(null);
+            this._invalidate();
+          }).catch((err) => this.onError(err, 'Ink could not be refreshed'));
+        }
       },
       onClose: () => { this.focusPinId = null; this._invalidate(); },
     });

@@ -12,3 +12,7 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npm run check
       - run: npm test
+      - name: Validate offline cache matches application sources
+        run: |
+          node tools/gen-sw.mjs
+          git diff --exit-code -- sw.js

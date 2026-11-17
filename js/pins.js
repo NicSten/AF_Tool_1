@@ -17,14 +17,13 @@ export async function createPin({ projectId, docId = null, page = null, x = 0, y
   const now = Date.now();
   const pin = {
     id: db.newId(), projectId, docId, page, x, y, type,
-    tag: await db.nextTag(projectId, typeOf(type).prefix),
+    tag: '',
     presetId: preset?.id ?? null,
     presetName: preset?.name ?? '',
     fields: (preset?.fields ?? []).map((name) => ({ name, value: '' })),
     notes: '', created: now, updated: now,
   };
-  await db.putPin(pin);
-  return pin;
+  return db.putPin(pin, { autoPrefix: typeOf(type).prefix });
 }
 
 // Switches a pin to a preset: its fields come first, values already entered are kept.
@@ -293,9 +292,10 @@ export class PinSheet {
     pin.notes = el.notes.value.trim();
   }
 
-  async _save() {
+  async _save(options) {
     const pin = this.pin;
-    await db.putPin(pin);
+    const saved = await db.putPin(pin, options);
+    Object.assign(pin, saved);
     this.onChange?.(pin, pin.id);
   }
 
@@ -309,9 +309,15 @@ export class PinSheet {
       el.tag.value = pin.tag;
       return;
     }
+    const previous = pin.tag;
     pin.tag = tag;
     el.tag.value = tag;
-    await this._save();
+    try { await this._save(); }
+    catch (err) {
+      pin.tag = previous;
+      el.tag.value = previous;
+      throw err;
+    }
     await this._renderPhotos();     // photo names follow the tag
   }
 
@@ -319,15 +325,20 @@ export class PinSheet {
     const { pin, el } = this;
     const from = typeOf(pin.type);
     this._collect();
+    const before = structuredClone(pin);
     pin.type = el.type.value;
     pin.presetId = null;
     pin.presetName = '';
-    // An untouched auto tag follows the new type; a custom tag is left alone.
-    if (new RegExp(`^${from.prefix}-\\d+$`, 'i').test(pin.tag)) {
-      pin.tag = await db.nextTag(pin.projectId, typeOf(pin.type).prefix);
-      el.tag.value = pin.tag;
+    const autoPrefix = new RegExp('^' + from.prefix + '-\\d+$', 'i').test(pin.tag)
+      ? typeOf(pin.type).prefix : null;
+    try { await this._save(autoPrefix ? { autoPrefix } : undefined); }
+    catch (err) {
+      Object.assign(pin, before);
+      el.type.value = before.type;
+      el.tag.value = before.tag;
+      throw err;
     }
-    await this._save();
+    el.tag.value = pin.tag;
     this._renderHead();
     await this._renderPhotos();
   }
