@@ -4,6 +4,8 @@
 import * as db from './db.js';
 import { closePdf, openPdf } from './pdf.js';
 import { photoName } from './pins.js';
+import { csvCell } from './csv.js';
+import { validateBackup, entryLimit, verifyBackupEntry } from './backup-validation.js';
 import { uniquePhotoNames } from './photo-names.js';
 import { TYPES, typeOf } from './types.js';
 import { safeName } from './ui.js';
@@ -102,11 +104,6 @@ function uniqueNamer() {
 }
 
 // ---------------------------------------------------------------- csv
-
-const csvCell = (v) => {
-  const s = String(v ?? '');
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-};
 
 function csvFor(pins, docById, photosByPin, photoNames) {
   const fieldNames = [];
@@ -452,48 +449,7 @@ export async function backupProject(projectId, setStatus = () => {}, { writable 
 }
 
 
-// Validate the metadata before writing any device/project record.
-// A broken or unrelated ZIP produces an actionable error, not a TypeError.
-function validateBackup(data) {
-  if (!data || data.format !== BACKUP_FORMAT || !data.project?.id || typeof data.project.name !== 'string') {
-    throw new Error('That ZIP is not an AF Field backup.');
-  }
-  if (!Number.isInteger(data.version) || data.version < 1) throw new Error('Backup format version is missing or invalid.');
-  if (data.version > BACKUP_VERSION) throw new Error('This backup is from a newer app version. Update the app first.');
-  if (!Number.isFinite(data.project.updated)) throw new Error('Backup has invalid project metadata.');
-  for (const field of ['docs', 'ink', 'pins', 'photos', 'presets']) {
-    if (!Array.isArray(data[field])) throw new Error('Backup metadata is invalid: missing ' + field + ' list.');
-  }
-  const idOK = (id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
-  if (!idOK(data.project.id)) throw new Error('Backup contains an invalid project ID.');
-  for (const doc of data.docs) {
-    if (!idOK(doc?.id) || typeof doc.name !== 'string' || doc.projectId !== data.project.id)
-      throw new Error('Backup contains an invalid drawing record.');
-  }
-  for (const photo of data.photos) {
-    if (!idOK(photo?.id) || !idOK(photo.pinId) || photo.projectId !== data.project.id)
-      throw new Error('Backup contains an invalid photo record.');
-  }
-  for (const pin of data.pins) {
-    if (!idOK(pin?.id) || pin.projectId !== data.project.id || !Array.isArray(pin.fields))
-      throw new Error('Backup contains an invalid device record.');
-  }
-  for (const entry of data.ink) {
-    if (!idOK(entry?.docId) || !Number.isInteger(entry.page) || !Array.isArray(entry.strokes))
-      throw new Error('Backup contains an invalid ink record.');
-  }
-  for (const preset of data.presets) if (!idOK(preset?.id))
-    throw new Error('Backup contains an invalid preset.');
-  const required = new Set(['backup.json']);
-  const allowed = new Set(required);
-  for (const doc of data.docs) {
-    required.add('files/' + doc.id + '.pdf');
-    allowed.add('thumbs/' + doc.id + '.jpg');
-  }
-  for (const photo of data.photos) required.add('photos/' + photo.id + '.jpg');
-  for (const name of required) allowed.add(name);
-  return { required, allowed };
-}
+// Metadata validation is provided by the separately tested backup-validation module.
 
 // Unzip incrementally. Store one finished PDF/photo at a time in a temporary
 // IndexedDB store instead of retaining the entire expanded archive in RAM.
@@ -514,6 +470,10 @@ export async function readBackup(file) {
       failure = new Error('Invalid backup: unexpected or repeated archive file ' + name);
       return;
     }
+    if (entry.originalSize != null && entry.originalSize > entryLimit(name)) {
+      failure = new Error('Backup validation failed: archive entry is too large: ' + name);
+      return;
+    }
     const chunks = [];
     let length = 0;
     entry.ondata = (err, bytes, final) => {
@@ -521,8 +481,8 @@ export async function readBackup(file) {
       if (failure) return;
       if (bytes?.length) {
         length += bytes.length;
-        if (name === 'backup.json' && length > 32 * 1024 * 1024) {
-          failure = new Error('Backup metadata is unreasonably large.');
+        if (length > entryLimit(name)) {
+          failure = new Error('Backup validation failed: oversized archive entry: ' + name);
           return;
         }
         chunks.push(bytes.slice());
@@ -537,6 +497,8 @@ export async function readBackup(file) {
         try { manifest = validateBackup(data); }
         catch (e) { failure = e; return; }
       } else {
+        try { verifyBackupEntry(name, output, manifest); }
+        catch (err) { failure = err; return; }
         const m = /^(files|photos|thumbs)\/([A-Za-z0-9_-]+)\.(pdf|jpg)$/.exec(name);
         if (!m) { failure = new Error('Backup has an invalid archive path.'); return; }
         const [, kind, id] = m;
