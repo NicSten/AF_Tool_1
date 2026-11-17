@@ -184,11 +184,17 @@
   </dialog>
 
   <dialog id="camera">
-    <video id="camera-video" playsinline muted></video>
+    <video id="camera-video" playsinline muted hidden></video>
+    <p id="camera-help" class="camera-help" aria-live="polite"></p>
+    <div class="camera-settings">
+      <button class="btn" id="camera-use-app" type="button">Use camera app</button>
+      <button class="btn" id="camera-torch" type="button" aria-pressed="false" hidden>Light off</button>
+      <label id="camera-zoom-label" hidden>Zoom <input id="camera-zoom" type="range" min="1" max="4" step="0.1"></label>
+    </div>
     <div class="camera-bar">
       <span id="camera-count"></span>
-      <button id="camera-shoot" aria-label="Take photo"></button>
-      <button class="btn" id="camera-done">Done</button>
+      <button id="camera-shoot" type="button" aria-label="Take photo" hidden></button>
+      <button class="btn" id="camera-done" type="button">Done</button>
     </div>
   </dialog>
   <input type="file" id="camera-file" accept="image/*" capture="environment" hidden>
