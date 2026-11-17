@@ -54,8 +54,6 @@ function openDb() {
       };
       req.onsuccess = () => {
         const connection = req.result;
-        // A blocked request may eventually succeed after its caller gave up.
-        // Close it rather than caching a handle that no caller owns.
         if (settled) { connection.close(); return; }
         settled = true;
         connection.onversionchange = () => {
@@ -80,8 +78,6 @@ async function tx(stores, mode, fn) {
     let t;
     try { t = db.transaction(stores, mode); }
     catch (err) {
-      // A previous connection was invalidated by an upgrade. The next
-      // operation will create a fresh connection instead of keeping it forever.
       if (err.name === 'InvalidStateError') dbPromise = null;
       reject(err);
       return;
@@ -259,13 +255,11 @@ export async function listPins(projectId) {
 export const listDocPins = (docId) => tx('pins', 'readonly', (s) => req(s.index('docId').getAll(docId)));
 export const getPin = (id) => tx('pins', 'readonly', (s) => req(s.get(id)));
 
-// Allocate tags while holding the same readwrite transaction as the insert.
-// IndexedDB serializes overlapping write transactions, so simultaneous pin
-// creation cannot allocate the same auto tag.
+// Allocate tags and persist the pin in the same write transaction.
 function nextTagFromPins(existing, prefix, exceptId = null) {
   if (typeof prefix !== 'string' || !/^[a-z0-9_-]+$/i.test(prefix))
     throw new Error('Invalid device tag prefix.');
-  const pattern = new RegExp('^' + prefix + '-(\\d+)
+  const pattern = new RegExp('^' + prefix + '-(\\d+)$', 'i');
   let max = 0;
   for (const pin of existing) {
     if (pin.id === exceptId) continue;
@@ -292,8 +286,7 @@ export function putPin(pin, { autoPrefix = null } = {}) {
   });
 }
 
-// Delete pin metadata and clear every stroke's attachment within ONE
-// transaction. The ink itself is retained on its original drawing.
+// Deleting a pin clears attachment pointers without removing ink strokes.
 export function deletePin(id) {
   return tx(['pins', 'photos', 'photoData', 'projects', 'docs', 'ink'], 'readwrite',
     async (pins, photos, photoData, projects, docs, ink) => {
@@ -320,165 +313,7 @@ export function deletePin(id) {
     });
 }
 
-// Preview only: saving an automatically assigned tag must go through
-// putPin(pin, { autoPrefix }) to allocate and write it atomically.
-export async function nextTag(projectId, prefix) {
-  return nextTagFromPins(await listPins(projectId), prefix);
-}
-
-// ---- photos ----
-
-const bySeq = (a, b) => a.seq - b.seq;
-
-export async function listPhotos(pinId) {
-  return (await tx('photos', 'readonly', (s) => req(s.index('pinId').getAll(pinId)))).sort(bySeq);
-}
-
-export async function listProjectPhotos(projectId) {
-  return (await tx('photos', 'readonly', (s) => req(s.index('projectId').getAll(projectId)))).sort(bySeq);
-}
-
-export const getPhotoData = (id) => tx('photoData', 'readonly', (s) => req(s.get(id)));
-
-export async function addPhoto(pin, buffer) {
-  return tx(['photos', 'photoData', 'projects'], 'readwrite', async (photos, photoData, projects) => {
-    const existing = await req(photos.index('pinId').getAll(pin.id));
-    const photo = {
-      id: newId(), pinId: pin.id, projectId: pin.projectId,
-      seq: existing.reduce((m, p) => Math.max(m, p.seq), 0) + 1,
-      size: buffer.byteLength, created: Date.now(),
-    };
-    photos.put(photo);
-    photoData.put(buffer, photo.id);
-    const p = await req(projects.get(pin.projectId));
-    if (p) projects.put({ ...p, updated: Date.now() });
-    return photo;
-  });
-}
-
-export function deletePhoto(photo) {
-  return tx(['photos', 'photoData', 'projects'], 'readwrite', async (photos, photoData, projects) => {
-    photos.delete(photo.id);
-    photoData.delete(photo.id);
-    const p = await req(projects.get(photo.projectId));
-    if (p) projects.put({ ...p, updated: Date.now() });
-  });
-}
-
-// ---- presets ----
-
-export async function listPresets() {
-  const list = await tx('presets', 'readonly', (s) => req(s.getAll()));
-  return list.sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.name.localeCompare(b.name));
-}
-
-export const putPreset = (preset) => tx('presets', 'readwrite', (s) => req(s.put(preset)));
-export const deletePreset = (id) => tx('presets', 'readwrite', (s) => req(s.delete(id)));
-
-// ---- backup / restore ----
-
-// Everything about a project except the large binaries (PDFs, photos), which the
-// caller streams one at a time with getFile / getPhotoData.
-export function dumpProject(projectId) {
-  return tx(['projects', 'docs', 'ink', 'pins', 'photos', 'presets'], 'readonly',
-    async (projects, docs, ink, pins, photos, presets) => {
-      const project = await req(projects.get(projectId));
-      const docList = await req(docs.index('projectId').getAll(projectId));
-      const inkList = [];
-      for (const doc of docList) {
-        const [keys, values] = await Promise.all([req(ink.getAllKeys(docRange(doc.id))), req(ink.getAll(docRange(doc.id)))]);
-        keys.forEach((key, i) => inkList.push({ docId: doc.id, page: key[1], strokes: values[i] }));
-      }
-      return {
-        project,
-        docs: docList,
-        ink: inkList,
-        pins: await req(pins.index('projectId').getAll(projectId)),
-        photos: await req(photos.index('projectId').getAll(projectId)),
-        presets: await req(presets.getAll()),
-      };
-    });
-}
-
-// Writes a dumped project back. `files`, `photoData` and `thumbs` map ids to binary data.
-// Presets that already exist on this device are left as they are.
-export async function restoreProject(data, { files, photoData, thumbs }) {
-  await deleteProject(data.project.id);
-  return tx(['projects', 'docs', 'files', 'ink', 'thumbs', 'pins', 'photos', 'photoData', 'presets'], 'readwrite',
-    async (projects, docs, fileStore, ink, thumbStore, pins, photos, photoStore, presets) => {
-      projects.put(data.project);
-      for (const doc of data.docs) {
-        docs.put(doc);
-        fileStore.put(files.get(doc.id), doc.id);
-        if (thumbs.has(doc.id)) thumbStore.put(thumbs.get(doc.id), [doc.id, 1]);
-      }
-      data.ink.forEach((entry) => ink.put(entry.strokes, [entry.docId, entry.page]));
-      data.pins.forEach((pin) => pins.put(pin));
-      for (const photo of data.photos) {
-        photos.put(photo);
-        photoStore.put(photoData.get(photo.id), photo.id);
-      }
-      const have = new Set(await req(presets.getAllKeys()));
-      data.presets.filter((p) => !have.has(p.id)).forEach((p) => presets.put(p));
-    });
-}
-, 'i');
-  let max = 0;
-  for (const pin of existing) {
-    if (pin.id === exceptId) continue;
-    const match = pattern.exec(pin.tag);
-    if (match) max = Math.max(max, Number(match[1]));
-  }
-  return prefix + '-' + String(max + 1).padStart(3, '0');
-}
-
-export function putPin(pin, { autoPrefix = null } = {}) {
-  return tx(['pins', 'projects'], 'readwrite', async (pins, projects) => {
-    const project = await req(projects.get(pin.projectId));
-    if (!project) throw new Error('The project no longer exists.');
-    const existing = await req(pins.index('projectId').getAll(pin.projectId));
-    const tag = autoPrefix ? nextTagFromPins(existing, autoPrefix, pin.id) : String(pin.tag ?? '').trim();
-    if (!tag) throw new Error('A device tag is required.');
-    if (existing.some((other) => other.id !== pin.id && other.tag.toLowerCase() === tag.toLowerCase()))
-      throw new Error('Device tag "' + tag + '" is already in use in this project.');
-    const now = Date.now();
-    const saved = { ...pin, tag, updated: now };
-    await req(pins.put(saved));
-    await req(projects.put({ ...project, updated: now }));
-    return saved;
-  });
-}
-
-// Delete pin metadata and clear every stroke's attachment within ONE
-// transaction. The ink itself is retained on its original drawing.
-export function deletePin(id) {
-  return tx(['pins', 'photos', 'photoData', 'projects', 'docs', 'ink'], 'readwrite',
-    async (pins, photos, photoData, projects, docs, ink) => {
-      const pin = await req(pins.get(id));
-      if (!pin) return;
-      for (const key of await req(photos.index('pinId').getAllKeys(id))) {
-        photos.delete(key);
-        photoData.delete(key);
-      }
-      for (const docId of await req(docs.index('projectId').getAllKeys(pin.projectId))) {
-        for (const key of await req(ink.getAllKeys(docRange(docId)))) {
-          const strokes = await req(ink.get(key));
-          if (!strokes?.some((stroke) => stroke.pin === id)) continue;
-          ink.put(strokes.map((stroke) => {
-            if (stroke.pin !== id) return stroke;
-            const { pin: attachedPin, ...detached } = stroke;
-            return detached;
-          }), key);
-        }
-      }
-      pins.delete(id);
-      const project = await req(projects.get(pin.projectId));
-      if (project) projects.put({ ...project, updated: Date.now() });
-    });
-}
-
-// Preview only: saving an automatically assigned tag must go through
-// putPin(pin, { autoPrefix }) to allocate and write it atomically.
+// Preview only; auto-assigned tags must be committed via putPin.
 export async function nextTag(projectId, prefix) {
   return nextTagFromPins(await listPins(projectId), prefix);
 }
