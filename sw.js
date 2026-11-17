@@ -2,7 +2,7 @@
 // Offline support: every app file is copied into the cache when the app is first
 // opened online; after that the app loads from the cache with or without signal.
 
-const CACHE = 'af-field-atomic-batch2-20261117';
+const CACHE = 'af-field-d9eaae05078f';
 const FILES = [
   "./",
   "index.html",
@@ -264,3 +264,4 @@ self.addEventListener('fetch', (event) => {
     return cached || fetch(request);
   })());
 });
+
