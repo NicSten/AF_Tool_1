@@ -23,8 +23,14 @@ let dbPromise;
 
 function openDb() {
   if (!dbPromise) {
-    dbPromise = new Promise((resolve, reject) => {
+    const opening = new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
+      let settled = false;
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
       req.onupgradeneeded = (e) => {
         const db = req.result;
         if (e.oldVersion < 1) {
@@ -47,12 +53,22 @@ function openDb() {
         }
       };
       req.onsuccess = () => {
-        req.result.onversionchange = () => req.result.close();
-        resolve(req.result);
+        const connection = req.result;
+        // A blocked request may eventually succeed after its caller gave up.
+        // Close it rather than caching a handle that no caller owns.
+        if (settled) { connection.close(); return; }
+        settled = true;
+        connection.onversionchange = () => {
+          connection.close();
+          if (dbPromise === opening) dbPromise = null;
+        };
+        resolve(connection);
       };
-      req.onerror = () => reject(req.error);
-      req.onblocked = () => reject(new Error('Storage is in use by another tab.'));
+      req.onerror = () => fail(req.error || new Error('Could not open local storage.'));
+      req.onblocked = () => fail(new Error('Storage is in use by another tab. Close other copies and retry.'));
     });
+    dbPromise = opening;
+    opening.catch(() => { if (dbPromise === opening) dbPromise = null; });
   }
   return dbPromise;
 }
@@ -61,7 +77,15 @@ function openDb() {
 async function tx(stores, mode, fn) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
-    const t = db.transaction(stores, mode);
+    let t;
+    try { t = db.transaction(stores, mode); }
+    catch (err) {
+      // A previous connection was invalidated by an upgrade. The next
+      // operation will create a fresh connection instead of keeping it forever.
+      if (err.name === 'InvalidStateError') dbPromise = null;
+      reject(err);
+      return;
+    }
     let result;
     t.oncomplete = () => resolve(result);
     t.onerror = () => reject(t.error);
@@ -80,7 +104,7 @@ const req = (r) => new Promise((resolve, reject) => {
 export const newId = () => (crypto.randomUUID ? crypto.randomUUID()
   : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
 
-const docRange = (docId) => IDBKeyRange.bound([docId, 0], [docId, Infinity]);
+const docRange = (docId) => IDBKeyRange.bound([docId, 0], [docId, Number.MAX_SAFE_INTEGER]);
 
 // ---- projects ----
 
@@ -235,36 +259,72 @@ export async function listPins(projectId) {
 export const listDocPins = (docId) => tx('pins', 'readonly', (s) => req(s.index('docId').getAll(docId)));
 export const getPin = (id) => tx('pins', 'readonly', (s) => req(s.get(id)));
 
-export function putPin(pin) {
-  return tx(['pins', 'projects'], 'readwrite', async (pins, projects) => {
-    pins.put({ ...pin, updated: Date.now() });
-    const p = await req(projects.get(pin.projectId));
-    if (p) projects.put({ ...p, updated: Date.now() });
-  });
-}
-
-export function deletePin(id) {
-  return tx(['pins', 'photos', 'photoData', 'projects'], 'readwrite', async (pins, photos, photoData, projects) => {
-    const pin = await req(pins.get(id));
-    for (const key of await req(photos.index('pinId').getAllKeys(id))) {
-      photos.delete(key);
-      photoData.delete(key);
-    }
-    pins.delete(id);
-    const p = pin && await req(projects.get(pin.projectId));
-    if (p) projects.put({ ...p, updated: Date.now() });
-  });
-}
-
-// Next free tag for a prefix within a project: BKR-001, BKR-002, ...
-export async function nextTag(projectId, prefix) {
-  const pattern = new RegExp(`^${prefix}-(\\d+)$`, 'i');
+// Allocate tags while holding the same readwrite transaction as the insert.
+// IndexedDB serializes overlapping write transactions, so simultaneous pin
+// creation cannot allocate the same auto tag.
+function nextTagFromPins(existing, prefix, exceptId = null) {
+  if (typeof prefix !== 'string' || !/^[a-z0-9_-]+$/i.test(prefix))
+    throw new Error('Invalid device tag prefix.');
+  const escaped = prefix.replace(/[.*+?^$\{\}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp('^' + escaped + '-(\\d+)$', 'i');
   let max = 0;
-  for (const pin of await listPins(projectId)) {
-    const m = pattern.exec(pin.tag);
-    if (m) max = Math.max(max, Number(m[1]));
+  for (const pin of existing) {
+    if (pin.id === exceptId) continue;
+    const match = pattern.exec(pin.tag);
+    if (match) max = Math.max(max, Number(match[1]));
   }
-  return `${prefix}-${String(max + 1).padStart(3, '0')}`;
+  return prefix + '-' + String(max + 1).padStart(3, '0');
+}
+
+export function putPin(pin, { autoPrefix = null } = {}) {
+  return tx(['pins', 'projects'], 'readwrite', async (pins, projects) => {
+    const project = await req(projects.get(pin.projectId));
+    if (!project) throw new Error('The project no longer exists.');
+    const existing = await req(pins.index('projectId').getAll(pin.projectId));
+    const tag = autoPrefix ? nextTagFromPins(existing, autoPrefix, pin.id) : String(pin.tag ?? '').trim();
+    if (!tag) throw new Error('A device tag is required.');
+    if (existing.some((other) => other.id !== pin.id && other.tag.toLowerCase() === tag.toLowerCase()))
+      throw new Error('Device tag "' + tag + '" is already in use in this project.');
+    const now = Date.now();
+    const saved = { ...pin, tag, updated: now };
+    await req(pins.put(saved));
+    await req(projects.put({ ...project, updated: now }));
+    return saved;
+  });
+}
+
+// Delete pin metadata and clear every stroke's attachment within ONE
+// transaction. The ink itself is retained on its original drawing.
+export function deletePin(id) {
+  return tx(['pins', 'photos', 'photoData', 'projects', 'docs', 'ink'], 'readwrite',
+    async (pins, photos, photoData, projects, docs, ink) => {
+      const pin = await req(pins.get(id));
+      if (!pin) return;
+      for (const key of await req(photos.index('pinId').getAllKeys(id))) {
+        photos.delete(key);
+        photoData.delete(key);
+      }
+      for (const docId of await req(docs.index('projectId').getAllKeys(pin.projectId))) {
+        for (const key of await req(ink.getAllKeys(docRange(docId)))) {
+          const strokes = await req(ink.get(key));
+          if (!strokes?.some((stroke) => stroke.pin === id)) continue;
+          ink.put(strokes.map((stroke) => {
+            if (stroke.pin !== id) return stroke;
+            const { pin: attachedPin, ...detached } = stroke;
+            return detached;
+          }), key);
+        }
+      }
+      pins.delete(id);
+      const project = await req(projects.get(pin.projectId));
+      if (project) projects.put({ ...project, updated: Date.now() });
+    });
+}
+
+// Preview only: saving an automatically assigned tag must go through
+// putPin(pin, { autoPrefix }) to allocate and write it atomically.
+export async function nextTag(projectId, prefix) {
+  return nextTagFromPins(await listPins(projectId), prefix);
 }
 
 // ---- photos ----
