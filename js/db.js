@@ -6,9 +6,18 @@
 //   files     docId -> ArrayBuffer (the PDF bytes, kept apart so listings stay cheap)
 //   ink       [docId, page] -> [{c: color, w: width, p: [x0, y0, x1, y1, ...]}]  (PDF points)
 //   thumbs    [docId, page] -> Blob (JPEG)
+//   pins      {id, projectId, docId|null, page|null, x, y, type, tag, presetId, presetName,
+//              fields: [{name, value}], notes, created, updated}   (docId null = not on a drawing)
+//   photos    {id, pinId, projectId, seq, size, created}   (file name is derived from the pin's tag)
+//   photoData photoId -> ArrayBuffer (JPEG)
+//   presets   {id, type, name, fields: [name], order}   (shared by all projects)
+//
+// A stroke may carry `pin: pinId` when it has been attached to a device with the lasso.
+
+import { DEFAULT_PRESETS } from './types.js';
 
 const DB_NAME = 'af-field';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 let dbPromise;
 
@@ -16,13 +25,26 @@ function openDb() {
   if (!dbPromise) {
     dbPromise = new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
+      req.onupgradeneeded = (e) => {
         const db = req.result;
-        db.createObjectStore('projects', { keyPath: 'id' });
-        db.createObjectStore('docs', { keyPath: 'id' }).createIndex('projectId', 'projectId');
-        db.createObjectStore('files');
-        db.createObjectStore('ink');
-        db.createObjectStore('thumbs');
+        if (e.oldVersion < 1) {
+          db.createObjectStore('projects', { keyPath: 'id' });
+          db.createObjectStore('docs', { keyPath: 'id' }).createIndex('projectId', 'projectId');
+          db.createObjectStore('files');
+          db.createObjectStore('ink');
+          db.createObjectStore('thumbs');
+        }
+        if (e.oldVersion < 2) {
+          const pins = db.createObjectStore('pins', { keyPath: 'id' });
+          pins.createIndex('projectId', 'projectId');
+          pins.createIndex('docId', 'docId');
+          const photos = db.createObjectStore('photos', { keyPath: 'id' });
+          photos.createIndex('projectId', 'projectId');
+          photos.createIndex('pinId', 'pinId');
+          db.createObjectStore('photoData');
+          const presets = db.createObjectStore('presets', { keyPath: 'id' });
+          DEFAULT_PRESETS.forEach((p) => presets.put(p));
+        }
       };
       req.onsuccess = () => {
         req.result.onversionchange = () => req.result.close();
@@ -55,7 +77,7 @@ const req = (r) => new Promise((resolve, reject) => {
   r.onerror = () => reject(r.error);
 });
 
-const newId = () => (crypto.randomUUID ? crypto.randomUUID()
+export const newId = () => (crypto.randomUUID ? crypto.randomUUID()
   : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
 
 const docRange = (docId) => IDBKeyRange.bound([docId, 0], [docId, Infinity]);
@@ -63,10 +85,12 @@ const docRange = (docId) => IDBKeyRange.bound([docId, 0], [docId, Infinity]);
 // ---- projects ----
 
 export async function listProjects() {
-  return tx(['projects', 'docs'], 'readonly', async (projects, docs) => {
+  return tx(['projects', 'docs', 'pins'], 'readonly', async (projects, docs, pins) => {
     const list = await req(projects.getAll());
-    const idx = docs.index('projectId');
-    await Promise.all(list.map(async (p) => { p.docCount = await req(idx.count(p.id)); }));
+    const docIdx = docs.index('projectId'), pinIdx = pins.index('projectId');
+    await Promise.all(list.map(async (p) => {
+      [p.docCount, p.pinCount] = await Promise.all([req(docIdx.count(p.id)), req(pinIdx.count(p.id))]);
+    }));
     return list.sort((a, b) => b.updated - a.updated);
   });
 }
@@ -88,17 +112,45 @@ export function renameProject(id, name) {
 }
 
 export function deleteProject(id) {
-  return tx(['projects', 'docs', 'files', 'ink', 'thumbs'], 'readwrite',
-    async (projects, docs, files, ink, thumbs) => {
-      const ids = await req(docs.index('projectId').getAllKeys(id));
-      for (const docId of ids) {
+  return tx(['projects', 'docs', 'files', 'ink', 'thumbs', 'pins', 'photos', 'photoData'], 'readwrite',
+    async (projects, docs, files, ink, thumbs, pins, photos, photoData) => {
+      const [docIds, pinIds, photoIds] = await Promise.all([
+        req(docs.index('projectId').getAllKeys(id)),
+        req(pins.index('projectId').getAllKeys(id)),
+        req(photos.index('projectId').getAllKeys(id)),
+      ]);
+      for (const docId of docIds) {
         docs.delete(docId);
         files.delete(docId);
         ink.delete(docRange(docId));
         thumbs.delete(docRange(docId));
       }
+      pinIds.forEach((k) => pins.delete(k));
+      photoIds.forEach((k) => { photos.delete(k); photoData.delete(k); });
       projects.delete(id);
     });
+}
+
+// Marks the project as changed (drives the "not backed up" warning).
+export function touchProject(id) {
+  return tx('projects', 'readwrite', async (s) => {
+    const p = await req(s.get(id));
+    if (p) s.put({ ...p, updated: Date.now() });
+  });
+}
+
+export function setBackedUp(id, time) {
+  return tx('projects', 'readwrite', async (s) => {
+    const p = await req(s.get(id));
+    if (p) s.put({ ...p, lastBackup: time });
+  });
+}
+
+// True when the project has changes that are not in a backup and no backup was made today.
+export function needsBackup(project) {
+  const last = project.lastBackup || 0;
+  if (project.updated <= last) return false;
+  return new Date(last).toDateString() !== new Date().toDateString();
 }
 
 // ---- documents ----
@@ -130,13 +182,21 @@ export function updateDoc(id, patch) {
   });
 }
 
+// Devices pinned on the drawing are kept, as devices that are not on a drawing.
 export function deleteDoc(id) {
-  return tx(['docs', 'files', 'ink', 'thumbs'], 'readwrite', (docs, files, ink, thumbs) => {
-    docs.delete(id);
-    files.delete(id);
-    ink.delete(docRange(id));
-    thumbs.delete(docRange(id));
-  });
+  return tx(['docs', 'files', 'ink', 'thumbs', 'pins', 'projects'], 'readwrite',
+    async (docs, files, ink, thumbs, pins, projects) => {
+      const doc = await req(docs.get(id));
+      for (const pin of await req(pins.index('docId').getAll(id))) {
+        pins.put({ ...pin, docId: null, page: null, x: 0, y: 0 });
+      }
+      docs.delete(id);
+      files.delete(id);
+      ink.delete(docRange(id));
+      thumbs.delete(docRange(id));
+      const p = doc && await req(projects.get(doc.projectId));
+      if (p) projects.put({ ...p, updated: Date.now() });
+    });
 }
 
 // ---- ink ----
@@ -145,10 +205,12 @@ export async function getInk(docId, page) {
   return (await tx('ink', 'readonly', (s) => req(s.get([docId, page])))) || [];
 }
 
-export function putInk(docId, page, strokes) {
-  return tx('ink', 'readwrite', (s) => req(
-    strokes.length ? s.put(strokes, [docId, page]) : s.delete([docId, page]),
-  ));
+export function putInk(docId, page, strokes, projectId) {
+  return tx(['ink', 'projects'], 'readwrite', async (s, projects) => {
+    if (strokes.length) s.put(strokes, [docId, page]); else s.delete([docId, page]);
+    const p = projectId && await req(projects.get(projectId));
+    if (p) projects.put({ ...p, updated: Date.now() });
+  });
 }
 
 // Page numbers of this document that carry ink.
@@ -161,3 +223,143 @@ export async function inkPages(docId) {
 
 export const getThumb = (docId, page) => tx('thumbs', 'readonly', (s) => req(s.get([docId, page])));
 export const putThumb = (docId, page, blob) => tx('thumbs', 'readwrite', (s) => req(s.put(blob, [docId, page])));
+
+// ---- pins (devices) ----
+
+const byTag = (a, b) => a.tag.localeCompare(b.tag, undefined, { numeric: true });
+
+export async function listPins(projectId) {
+  return (await tx('pins', 'readonly', (s) => req(s.index('projectId').getAll(projectId)))).sort(byTag);
+}
+
+export const listDocPins = (docId) => tx('pins', 'readonly', (s) => req(s.index('docId').getAll(docId)));
+export const getPin = (id) => tx('pins', 'readonly', (s) => req(s.get(id)));
+
+export function putPin(pin) {
+  return tx(['pins', 'projects'], 'readwrite', async (pins, projects) => {
+    pins.put({ ...pin, updated: Date.now() });
+    const p = await req(projects.get(pin.projectId));
+    if (p) projects.put({ ...p, updated: Date.now() });
+  });
+}
+
+export function deletePin(id) {
+  return tx(['pins', 'photos', 'photoData', 'projects'], 'readwrite', async (pins, photos, photoData, projects) => {
+    const pin = await req(pins.get(id));
+    for (const key of await req(photos.index('pinId').getAllKeys(id))) {
+      photos.delete(key);
+      photoData.delete(key);
+    }
+    pins.delete(id);
+    const p = pin && await req(projects.get(pin.projectId));
+    if (p) projects.put({ ...p, updated: Date.now() });
+  });
+}
+
+// Next free tag for a prefix within a project: BKR-001, BKR-002, ...
+export async function nextTag(projectId, prefix) {
+  const pattern = new RegExp(`^${prefix}-(\\d+)$`, 'i');
+  let max = 0;
+  for (const pin of await listPins(projectId)) {
+    const m = pattern.exec(pin.tag);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `${prefix}-${String(max + 1).padStart(3, '0')}`;
+}
+
+// ---- photos ----
+
+const bySeq = (a, b) => a.seq - b.seq;
+
+export async function listPhotos(pinId) {
+  return (await tx('photos', 'readonly', (s) => req(s.index('pinId').getAll(pinId)))).sort(bySeq);
+}
+
+export async function listProjectPhotos(projectId) {
+  return (await tx('photos', 'readonly', (s) => req(s.index('projectId').getAll(projectId)))).sort(bySeq);
+}
+
+export const getPhotoData = (id) => tx('photoData', 'readonly', (s) => req(s.get(id)));
+
+export async function addPhoto(pin, buffer) {
+  return tx(['photos', 'photoData', 'projects'], 'readwrite', async (photos, photoData, projects) => {
+    const existing = await req(photos.index('pinId').getAll(pin.id));
+    const photo = {
+      id: newId(), pinId: pin.id, projectId: pin.projectId,
+      seq: existing.reduce((m, p) => Math.max(m, p.seq), 0) + 1,
+      size: buffer.byteLength, created: Date.now(),
+    };
+    photos.put(photo);
+    photoData.put(buffer, photo.id);
+    const p = await req(projects.get(pin.projectId));
+    if (p) projects.put({ ...p, updated: Date.now() });
+    return photo;
+  });
+}
+
+export function deletePhoto(photo) {
+  return tx(['photos', 'photoData', 'projects'], 'readwrite', async (photos, photoData, projects) => {
+    photos.delete(photo.id);
+    photoData.delete(photo.id);
+    const p = await req(projects.get(photo.projectId));
+    if (p) projects.put({ ...p, updated: Date.now() });
+  });
+}
+
+// ---- presets ----
+
+export async function listPresets() {
+  const list = await tx('presets', 'readonly', (s) => req(s.getAll()));
+  return list.sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.name.localeCompare(b.name));
+}
+
+export const putPreset = (preset) => tx('presets', 'readwrite', (s) => req(s.put(preset)));
+export const deletePreset = (id) => tx('presets', 'readwrite', (s) => req(s.delete(id)));
+
+// ---- backup / restore ----
+
+// Everything about a project except the large binaries (PDFs, photos), which the
+// caller streams one at a time with getFile / getPhotoData.
+export function dumpProject(projectId) {
+  return tx(['projects', 'docs', 'ink', 'pins', 'photos', 'presets'], 'readonly',
+    async (projects, docs, ink, pins, photos, presets) => {
+      const project = await req(projects.get(projectId));
+      const docList = await req(docs.index('projectId').getAll(projectId));
+      const inkList = [];
+      for (const doc of docList) {
+        const [keys, values] = await Promise.all([req(ink.getAllKeys(docRange(doc.id))), req(ink.getAll(docRange(doc.id)))]);
+        keys.forEach((key, i) => inkList.push({ docId: doc.id, page: key[1], strokes: values[i] }));
+      }
+      return {
+        project,
+        docs: docList,
+        ink: inkList,
+        pins: await req(pins.index('projectId').getAll(projectId)),
+        photos: await req(photos.index('projectId').getAll(projectId)),
+        presets: await req(presets.getAll()),
+      };
+    });
+}
+
+// Writes a dumped project back. `files`, `photoData` and `thumbs` map ids to binary data.
+// Presets that already exist on this device are left as they are.
+export async function restoreProject(data, { files, photoData, thumbs }) {
+  await deleteProject(data.project.id);
+  return tx(['projects', 'docs', 'files', 'ink', 'thumbs', 'pins', 'photos', 'photoData', 'presets'], 'readwrite',
+    async (projects, docs, fileStore, ink, thumbStore, pins, photos, photoStore, presets) => {
+      projects.put(data.project);
+      for (const doc of data.docs) {
+        docs.put(doc);
+        fileStore.put(files.get(doc.id), doc.id);
+        if (thumbs.has(doc.id)) thumbStore.put(thumbs.get(doc.id), [doc.id, 1]);
+      }
+      data.ink.forEach((entry) => ink.put(entry.strokes, [entry.docId, entry.page]));
+      data.pins.forEach((pin) => pins.put(pin));
+      for (const photo of data.photos) {
+        photos.put(photo);
+        photoStore.put(photoData.get(photo.id), photo.id);
+      }
+      const have = new Set(await req(presets.getAllKeys()));
+      data.presets.filter((p) => !have.has(p.id)).forEach((p) => presets.put(p));
+    });
+}

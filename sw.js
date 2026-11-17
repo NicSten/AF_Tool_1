@@ -2,7 +2,7 @@
 // Offline support: every app file is copied into the cache when the app is first
 // opened online; after that the app loads from the cache with or without signal.
 
-const CACHE = 'af-field-9d9174bf2afd';
+const CACHE = 'af-field-6e0d3c04f557';
 const FILES = [
   "./",
   "index.html",
@@ -10,11 +10,18 @@ const FILES = [
   "css/app.css",
   "js/app.js",
   "js/db.js",
+  "js/exporter.js",
   "js/pdf.js",
+  "js/pins.js",
+  "js/radial.js",
+  "js/types.js",
+  "js/ui.js",
   "js/viewer.js",
   "icons/icon-192.png",
   "icons/icon-512.png",
   "icons/icon-maskable-512.png",
+  "vendor/fflate/fflate.js",
+  "vendor/pdf-lib/pdf-lib.esm.min.js",
   "vendor/pdfjs/cmaps/78-EUC-H.bcmap",
   "vendor/pdfjs/cmaps/78-EUC-V.bcmap",
   "vendor/pdfjs/cmaps/78-H.bcmap",

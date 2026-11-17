@@ -27,6 +27,15 @@
       <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
       <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
       <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20l1-5L16.5 3.5a2.1 2.1 0 013 3L8 18l-4 2z"/></symbol>
+      <symbol id="i-lasso" viewBox="0 0 24 24"><ellipse cx="12" cy="10" rx="9" ry="6" stroke-dasharray="3.2 3"/><path d="M7 15c-1 2 0 4 1 6"/></symbol>
+      <symbol id="i-list" viewBox="0 0 24 24"><circle cx="5" cy="6" r="1.6"/><circle cx="5" cy="12" r="1.6"/><circle cx="5" cy="18" r="1.6"/><path d="M10 6h11M10 12h11M10 18h11"/></symbol>
+      <symbol id="i-camera" viewBox="0 0 24 24"><path d="M3 8h4l2-3h6l2 3h4v11H3z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+      <symbol id="i-export" viewBox="0 0 24 24"><path d="M12 15V4M7 8l5-5 5 5M4 14v6h16v-6"/></symbol>
+      <symbol id="i-backup" viewBox="0 0 24 24"><path d="M12 4v11M7 11l5 5 5-5M4 20h16"/></symbol>
+      <symbol id="i-restore" viewBox="0 0 24 24"><path d="M4 12a8 8 0 108-8H7M10 1L7 4l3 3"/><path d="M12 8v4l3 2"/></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+      <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18v.5"/></symbol>
       <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6.5 7l1 13h9l1-13M10 11v6M14 11v6"/></symbol>
     </defs>
   </svg>
@@ -35,6 +44,9 @@
   <section id="view-projects" class="view" hidden>
     <header class="bar">
       <h1>AF Field <span class="sub">Arc flash data collection</span></h1>
+      <a class="btn" href="#/presets"><svg class="icon"><use href="#i-sliders"/></svg>Presets</a>
+      <button class="btn" id="btn-restore"><svg class="icon"><use href="#i-restore"/></svg>Restore</button>
+      <input type="file" id="restore-input" accept=".zip,application/zip" hidden>
       <button class="btn primary" id="btn-new-project"><svg class="icon"><use href="#i-plus"/></svg>New project</button>
     </header>
     <main class="list" id="project-list"></main>
@@ -46,10 +58,40 @@
     <header class="bar">
       <a class="btn icon-only" href="#/" aria-label="Back to projects"><svg class="icon"><use href="#i-back"/></svg></a>
       <h1 id="project-title"></h1>
+      <a class="btn" id="btn-project-devices"><svg class="icon"><use href="#i-list"/></svg>Devices</a>
+      <button class="btn" id="btn-export"><svg class="icon"><use href="#i-export"/></svg>Export</button>
+      <button class="btn" id="btn-backup"><svg class="icon"><use href="#i-backup"/></svg>Back up</button>
       <button class="btn primary" id="btn-add-pdf"><svg class="icon"><use href="#i-plus"/></svg>Add PDFs</button>
       <input type="file" id="file-input" accept="application/pdf,.pdf" multiple hidden>
     </header>
+    <div class="banner" id="backup-warning" hidden>
+      <svg class="icon"><use href="#i-warn"/></svg>
+      <span id="backup-warning-text"></span>
+      <button class="btn" id="btn-backup-now">Back up now</button>
+    </div>
     <main class="list" id="doc-list"></main>
+  </section>
+
+  <!-- All devices in a project -->
+  <section id="view-pins" class="view" hidden>
+    <header class="bar">
+      <a class="btn icon-only" id="pins-back" href="#/" aria-label="Back to project"><svg class="icon"><use href="#i-back"/></svg></a>
+      <h1 id="pins-title"></h1>
+      <button class="btn primary" id="btn-add-device"><svg class="icon"><use href="#i-plus"/></svg>Add device</button>
+    </header>
+    <div class="chips" id="pin-filters"></div>
+    <main class="rows" id="pin-list"></main>
+  </section>
+
+  <!-- Preset manager -->
+  <section id="view-presets" class="view" hidden>
+    <header class="bar">
+      <a class="btn icon-only" href="#/" aria-label="Back to projects"><svg class="icon"><use href="#i-back"/></svg></a>
+      <h1>Presets <span class="sub">Fields offered when a pin is dropped</span></h1>
+      <button class="btn primary" id="btn-add-preset"><svg class="icon"><use href="#i-plus"/></svg>Add preset</button>
+    </header>
+    <div class="chips" id="preset-types"></div>
+    <main class="list" id="preset-list"></main>
   </section>
 
   <!-- Viewer -->
@@ -68,6 +110,7 @@
         <button class="btn icon-only pen" aria-label="Blue pen"><svg class="icon"><use href="#i-pen"/></svg></button>
         <button class="btn icon-only pen" aria-label="Green pen"><svg class="icon"><use href="#i-pen"/></svg></button>
         <button class="btn icon-only" id="btn-eraser" aria-label="Eraser"><svg class="icon"><use href="#i-eraser"/></svg></button>
+        <button class="btn icon-only" id="btn-lasso" aria-label="Lasso ink to attach it to a pin"><svg class="icon"><use href="#i-lasso"/></svg></button>
       </div>
       <div class="group">
         <button class="btn icon-only" id="btn-undo" aria-label="Undo"><svg class="icon"><use href="#i-undo"/></svg></button>
@@ -76,6 +119,7 @@
       <div class="group">
         <button class="btn icon-only" id="btn-eye" aria-label="Hide ink"><svg class="icon"><use href="#i-eye"/></svg></button>
         <button class="btn icon-only" id="btn-fit" aria-label="Fit sheet to screen"><svg class="icon"><use href="#i-fit"/></svg></button>
+        <a class="btn icon-only" id="btn-devices" aria-label="Device list"><svg class="icon"><use href="#i-list"/></svg></a>
       </div>
     </header>
     <div class="viewer-body">
@@ -85,6 +129,12 @@
         <canvas id="layer-detail"></canvas>
         <canvas id="layer-ink"></canvas>
         <canvas id="layer-live"></canvas>
+        <div id="pin-layer"></div>
+        <div id="lasso-bar" hidden>
+          <span id="lasso-text"></span>
+          <button class="btn" id="lasso-detach">Detach</button>
+          <button class="btn" id="lasso-cancel">Cancel</button>
+        </div>
         <div id="stage-busy" hidden><span class="spinner"></span></div>
       </div>
     </div>
@@ -103,7 +153,78 @@
     </form>
   </dialog>
 
-  <div id="toast" role="status" hidden></div>
+  <!-- Radial menu for dropping a pin (long-press with the pen) -->
+  <div id="radial" hidden></div>
+
+  <!-- Device detail -->
+  <dialog id="pin-sheet" class="sheet">
+    <div class="sheet-head">
+      <span id="pin-chip"></span>
+      <input id="pin-tag" type="text" aria-label="Tag" autocomplete="off" autocapitalize="characters" maxlength="40">
+      <button class="btn icon-only" id="pin-close" aria-label="Close"><svg class="icon"><use href="#i-close"/></svg></button>
+    </div>
+    <div class="sheet-row">
+      <label>Type<select id="pin-type"></select></label>
+      <label>Preset<select id="pin-preset"></select></label>
+    </div>
+    <div class="sheet-where">
+      <span id="pin-where"></span>
+      <button class="btn" id="pin-goto">Go to pin</button>
+    </div>
+    <p class="hint" id="pin-ink" hidden></p>
+    <h3>Fields</h3>
+    <div id="pin-fields"></div>
+    <button class="btn" id="pin-add-field"><svg class="icon"><use href="#i-plus"/></svg>Add field</button>
+    <h3>Notes</h3>
+    <textarea id="pin-notes" rows="3"></textarea>
+    <h3>Photos</h3>
+    <div id="pin-photos"></div>
+    <button class="btn primary" id="pin-camera"><svg class="icon"><use href="#i-camera"/></svg>Take photo</button>
+    <button class="btn danger-outline" id="pin-delete"><svg class="icon"><use href="#i-trash"/></svg>Delete device</button>
+  </dialog>
+
+  <dialog id="camera">
+    <video id="camera-video" playsinline muted></video>
+    <div class="camera-bar">
+      <span id="camera-count"></span>
+      <button id="camera-shoot" aria-label="Take photo"></button>
+      <button class="btn" id="camera-done">Done</button>
+    </div>
+  </dialog>
+  <input type="file" id="camera-file" accept="image/*" capture="environment" hidden>
+
+  <dialog id="photo-view">
+    <img id="photo-img" alt="">
+    <div class="photo-bar">
+      <span id="photo-name"></span>
+      <button class="btn danger" id="photo-delete">Delete</button>
+      <button class="btn" id="photo-close">Close</button>
+    </div>
+  </dialog>
+
+  <dialog id="preset-dialog">
+    <form method="dialog">
+      <h2 id="preset-dialog-title"></h2>
+      <label class="stack">Name<input id="preset-name" type="text" autocomplete="off" maxlength="40" required></label>
+      <h3>Fields</h3>
+      <div id="preset-fields"></div>
+      <button type="button" class="btn" id="preset-add-field"><svg class="icon"><use href="#i-plus"/></svg>Add field</button>
+      <div class="dialog-actions">
+        <button class="btn primary" value="ok">Save</button>
+        <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="type-picker">
+    <h2>Device type</h2>
+    <div id="type-picker-list"></div>
+    <div class="dialog-actions"><button class="btn" id="type-picker-cancel">Cancel</button></div>
+  </dialog>
+
+  <dialog id="busy"><span class="spinner"></span><p id="busy-text"></p></dialog>
+
+  <div id="toast" role="status" popover="manual" hidden></div>
 
   <script type="module" src="js/app.js"></script>
 </body>

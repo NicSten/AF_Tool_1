@@ -7,9 +7,17 @@
 //   base    whole page at modest resolution, moved with a CSS transform (instant pan/zoom)
 //   detail  just the visible region at full device resolution, re-rendered when the view settles
 //   ink     vector strokes redrawn at the current view; `live` holds the stroke in progress
+//   pins    one DOM element per device pin, positioned from the view each frame
+//
+// Pen input: drawing a stroke, erasing, lassoing ink (to attach it to a pin), dragging a
+// pin, and - on a long press - the radial menu that drops a new pin.
 
 import * as db from './db.js';
 import { closePdf, openPdf, renderThumb } from './pdf.js';
+import { createPin, missingFields } from './pins.js';
+import { Radial } from './radial.js';
+import { typeOf } from './types.js';
+import { esc, showError, toast } from './ui.js';
 
 export const COLORS = ['#e0162b', '#1456d9', '#0a8f3c'];
 
@@ -19,11 +27,14 @@ const MAX_SCALE = 10;         // CSS px per PDF point
 const BASE_MAX_PIXELS = 8e6;
 const UNDO_LIMIT = 200;
 const PALM_QUIET_MS = 350;    // touches are ignored this long after the pen lifts
+const LONG_PRESS_MS = 550;
+const HOLD_SLOP_PX = 8;       // movement allowed during a long press / before a pin drag starts
+const LASSO_INSIDE = 0.6;     // share of a stroke's points that must lie inside the loop
 
 const pathCache = new WeakMap();
 const boxCache = new WeakMap();
 
-function pathOf(stroke) {
+export function pathOf(stroke) {
   let path = pathCache.get(stroke);
   if (!path) {
     const a = stroke.p;
@@ -92,12 +103,22 @@ function segDist(ax, ay, bx, by, cx, cy, dx, dy) {
   );
 }
 
+function insidePolygon(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 2; i < poly.length; j = i, i += 2) {
+    const xi = poly[i], yi = poly[i + 1], xj = poly[j], yj = poly[j + 1];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const round2 = (v) => Math.round(v * 100) / 100;
 
 export class Viewer {
-  constructor(root, { onError }) {
-    this.onError = onError;
+  constructor(root, { sheet }) {
+    this.onError = showError;
+    this.sheet = sheet;
     const $ = (sel) => root.querySelector(sel);
     this.el = {
       title: $('#doc-title'), stage: $('#stage'), base: $('#layer-base'), detail: $('#layer-detail'),
@@ -105,7 +126,14 @@ export class Viewer {
       pageLabel: $('#page-label'), prev: $('#btn-prev'), next: $('#btn-next'),
       undo: $('#btn-undo'), redo: $('#btn-redo'), eye: $('#btn-eye'), eraser: $('#btn-eraser'),
       thumbsBtn: $('#btn-thumbs'), fit: $('#btn-fit'), pens: [...root.querySelectorAll('.pen')],
+      pinLayer: $('#pin-layer'), lasso: $('#btn-lasso'), devices: $('#btn-devices'),
+      lassoBar: $('#lasso-bar'), lassoText: $('#lasso-text'), lassoDetach: $('#lasso-detach'),
+      lassoCancel: $('#lasso-cancel'),
     };
+    this.pins = [];
+    this.pinEls = new Map();
+    this.presets = [];
+    this.radial = new Radial(document.querySelector('#radial'), (type) => this.presets.filter((p) => p.type === type));
     this.inkCtx = this.el.ink.getContext('2d');
     // The in-progress stroke gets its own low-latency canvas; committed ink stays on a normal one.
     this.liveCtx = this.el.live.getContext('2d', { desynchronized: true });
@@ -130,7 +158,7 @@ export class Viewer {
 
   // ---------------------------------------------------------------- lifecycle
 
-  async open(docId) {
+  async open(docId, pinId = null) {
     await this.close();
     const gen = this.gen;
     this._busy(true);
@@ -141,21 +169,47 @@ export class Viewer {
     this.doc = doc;
     this.pdf = pdf;
     this.history = new Map();   // page -> {undo: [], redo: []}, kept while the document is open
-    this.inked = await db.inkPages(docId);
+    [this.inked, this.pins, this.presets] = await Promise.all([
+      db.inkPages(docId), db.listDocPins(docId), db.listPresets(),
+    ]);
+    if (gen !== this.gen) return;
     this.el.title.textContent = doc.name;
+    this.el.devices.href = `#/p/${doc.projectId}/pins`;
     this._buildThumbs();
-    await this.goto(clamp(doc.lastPage || 1, 1, pdf.numPages));
+    const pin = pinId && this.pins.find((p) => p.id === pinId);
+    await this.goto(clamp(pin ? pin.page : doc.lastPage || 1, 1, pdf.numPages));
+    if (pin) this.focusPin(pinId);
+  }
+
+  // Brings a pin into view (changing page if needed) and flashes it.
+  async focusPin(pinId) {
+    const pin = this.pins.find((p) => p.id === pinId);
+    if (!pin || !this.pdf) return;
+    if (pin.page !== this.pageNum) await this.goto(pin.page);
+    if (!this.page || pin.page !== this.pageNum) return;
+    const s = clamp(this._fitView().s * 3, this.view.s, this._limits().max);
+    this._animateTo({ s, tx: this.W / 2 - pin.x * s, ty: this.H / 2 - pin.y * s });
+    const el = this.pinEls.get(pinId);
+    if (el) {
+      el.classList.add('pulse');
+      setTimeout(() => el.classList.remove('pulse'), 2600);
+    }
   }
 
   async close() {
     this.gen++;
     this._cancelRenders();
     this._stopAnim();
-    this.drawing = null;
+    this._dropPointers();
+    this.radial.close();
     this.touches.clear();
     this.ignored.clear();
     this.page = null;
     this.strokes = [];
+    this.pins = [];
+    this.focusPinId = null;
+    this._setSelection(null);
+    this._renderPins();
     this.el.base.style.visibility = 'hidden';
     this.el.detail.style.visibility = 'hidden';
     this._clear(this.inkCtx);
@@ -176,9 +230,12 @@ export class Viewer {
     const gen = ++this.gen;
     this._cancelRenders();
     this._stopAnim();
-    this.drawing = null;
+    this._dropPointers();
+    this.radial.close();
+    this._setSelection(null);
     this.page = null;
     this.pageNum = n;
+    this._renderPins();
     this.el.base.style.visibility = 'hidden';
     this.el.detail.style.visibility = 'hidden';
     this._clear(this.inkCtx);
@@ -199,6 +256,7 @@ export class Viewer {
     this.detailView = null;
     this._resize();
     this.view = this._fitView();
+    this._renderPins();
     this._syncToolbar();
     this._invalidate();
     db.updateDoc(doc.id, { lastPage: n }).catch(() => {});
@@ -296,6 +354,10 @@ export class Viewer {
       this.el.detail.style.transform = `translate(${tx - d.tx * k}px, ${ty - d.ty * k}px) scale(${k})`;
     }
     this._drawInk();
+    for (const pin of this.pins) {
+      const el = this.pinEls.get(pin.id);
+      if (el) el.style.transform = `translate(${pin.x * s + tx}px, ${pin.y * s + ty}px)`;
+    }
     if (!d || d.s !== s || d.tx !== tx || d.ty !== ty || d.W !== this.W || d.H !== this.H) {
       clearTimeout(this.detailTimer);
       this.detailTimer = setTimeout(() => this._renderDetail(), 140);
@@ -402,7 +464,15 @@ export class Viewer {
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     // While erasing, show the strokes that would remain.
-    for (const stroke of this.drawing?.remaining || this.strokes) {
+    const strokes = this.drawing?.remaining || this.strokes;
+    // Halo behind lassoed ink and behind ink attached to the pin whose details are open.
+    ctx.strokeStyle = 'rgba(255, 194, 26, 0.6)';
+    for (const stroke of strokes) {
+      if (!this.selection?.has(stroke) && !(this.focusPinId && stroke.pin === this.focusPinId)) continue;
+      ctx.lineWidth = stroke.w + 9 / s;
+      ctx.stroke(pathOf(stroke));
+    }
+    for (const stroke of strokes) {
       ctx.strokeStyle = stroke.c;
       ctx.lineWidth = stroke.w;
       ctx.stroke(pathOf(stroke));
@@ -419,9 +489,10 @@ export class Viewer {
 
   _setStrokes(strokes) {
     this.strokes = strokes;
+    this._setSelection(null);
     const { doc, pageNum } = this;
     if (strokes.length) this.inked.add(pageNum); else this.inked.delete(pageNum);
-    db.putInk(doc.id, pageNum, strokes).catch((err) => this.onError(err, 'Ink could not be saved'));
+    db.putInk(doc.id, pageNum, strokes, doc.projectId).catch((err) => this.onError(err, 'Ink could not be saved'));
     this._markThumb();
     this._syncToolbar();
     this._invalidate();
@@ -449,7 +520,133 @@ export class Viewer {
     this._invalidate();
   }
 
+  // ---------------------------------------------------------------- pins
+
+  _renderPins() {
+    this.pinEls.clear();
+    const els = [];
+    if (this.page) {
+      for (const pin of this.pins) {
+        if (pin.page !== this.pageNum) continue;
+        const el = document.createElement('div');
+        el.className = `pin${missingFields(pin).length ? ' incomplete' : ''}`;
+        el.dataset.id = pin.id;
+        el.setAttribute('role', 'button');
+        el.setAttribute('aria-label', `Device ${pin.tag}`);
+        el.style.setProperty('--c', typeOf(pin.type).color);
+        el.innerHTML = `<span class="pin-dot"></span><span class="pin-tag">${esc(pin.tag)}</span>`;
+        this.pinEls.set(pin.id, el);
+        els.push(el);
+      }
+    }
+    this.el.pinLayer.replaceChildren(...els);
+    this._invalidate();
+  }
+
+  async _dropPin(page, x, y, type, preset) {
+    const { doc } = this;
+    try {
+      const pin = await createPin({ projectId: doc.projectId, docId: doc.id, page, x, y, type, preset });
+      if (this.doc !== doc) return;
+      this.pins.push(pin);
+      this._renderPins();
+      this._openPin(pin.id);
+    } catch (err) {
+      this.onError(err, 'The pin was not saved');
+    }
+  }
+
+  _openPin(id) {
+    const { doc } = this;
+    this.focusPinId = id;
+    this._invalidate();
+    this.sheet.open(id, {
+      onChange: (pin, pinId) => {
+        if (this.doc !== doc) return;
+        this.pins = this.pins.filter((p) => p.id !== pinId);
+        if (pin && pin.docId === doc.id) this.pins.push(pin);
+        this._renderPins();
+      },
+      onClose: () => { this.focusPinId = null; this._invalidate(); },
+    });
+  }
+
+  _tapPin(id) {
+    if (this.selection) this._attach(id); else this._openPin(id);
+  }
+
+  // ---------------------------------------------------------------- lasso
+
+  _setSelection(strokes) {
+    this.selection = strokes?.size ? strokes : null;
+    const el = this.el;
+    el.lassoBar.hidden = !this.selection;
+    if (this.selection) {
+      const n = this.selection.size;
+      el.lassoText.textContent = `${n} stroke${n === 1 ? '' : 's'} selected — tap a pin to attach`;
+      el.lassoDetach.hidden = ![...this.selection].some((st) => st.pin);
+    }
+    this._invalidate();
+  }
+
+  _lasso(poly) {
+    const picked = new Set();
+    if (poly.length >= 6) {
+      for (const stroke of this.strokes) {
+        const a = stroke.p;
+        let inside = 0;
+        for (let i = 0; i < a.length; i += 2) if (insidePolygon(a[i], a[i + 1], poly)) inside++;
+        if (inside >= (a.length / 2) * LASSO_INSIDE) picked.add(stroke);
+      }
+    }
+    if (!picked.size) toast('No ink inside the loop.');
+    this._setSelection(picked);
+  }
+
+  _attach(pinId) {
+    const sel = this.selection;
+    const pin = this.pins.find((p) => p.id === pinId);
+    if (!sel || !pin) return;
+    this._commit(this.strokes.map((st) => (sel.has(st) ? { ...st, pin: pinId } : st)));
+    toast(`${sel.size} stroke${sel.size === 1 ? '' : 's'} attached to ${pin.tag}`);
+  }
+
+  _detach() {
+    const sel = this.selection;
+    if (!sel) return;
+    this._commit(this.strokes.map((st) => {
+      if (!sel.has(st) || !st.pin) return st;
+      const { pin, ...rest } = st;
+      return rest;
+    }));
+    toast('Ink detached');
+  }
+
   // ---------------------------------------------------------------- pointer input
+
+  // Abandons whatever the pen is doing (page change, close).
+  _dropPointers() {
+    clearTimeout(this.holdTimer);
+    this.drawing = null;
+    this.pinPress = null;
+    this.menuPointer = null;
+    this.mousePan = null;
+  }
+
+  // The pen has rested in one spot: discard the dot it drew and offer the pin menu.
+  _longPress() {
+    const d = this.drawing;
+    if (!d || (d.erase && d.remaining !== this.strokes)) return;
+    this.drawing = null;
+    this._clear(this.liveCtx);
+    this._drawInk();
+    const [px, py] = this._toPage(d.x0, d.y0);
+    const { s, tx, ty } = this.view;
+    const page = this.pageNum;
+    this.menuPointer = d.id;
+    this.radial.open(this.rect.left + px * s + tx, this.rect.top + py * s + ty,
+      (type, preset) => this._dropPin(page, px, py, type, preset));
+  }
 
   _bindPointer() {
     const stage = this.el.stage;
@@ -492,7 +689,8 @@ export class Viewer {
       this._stopAnim();
       this._capture(e);
       const p = this._pos(e);
-      this.touches.set(e.pointerId, { x: p.x, y: p.y, x0: p.x, y0: p.y, t0: now });
+      const pinId = e.target.closest?.('.pin')?.dataset.id;
+      this.touches.set(e.pointerId, { x: p.x, y: p.y, x0: p.x, y0: p.y, t0: now, pinId });
       if (this.touches.size > 1) this.lastTap = null;
       return;
     }
@@ -503,19 +701,28 @@ export class Viewer {
       this.mousePan = { id: e.pointerId, ...this._pos(e) };
       return;
     }
-    if (this.drawing) return;
+    if (this.drawing || this.pinPress || this.menuPointer != null) return;
 
     // Pen (or left mouse button on a desktop) draws. Any fingers already down are a palm.
     for (const id of this.touches.keys()) this.ignored.add(id);
     this.touches.clear();
     this._stopAnim();
     this._capture(e);
+    const pinEl = e.target.closest?.('.pin');
+    if (pinEl) {                                   // tap opens the pin, drag moves it
+      const pin = this.pins.find((q) => q.id === pinEl.dataset.id);
+      if (pin) this.pinPress = { id: e.pointerId, pin, ...this._pos(e), moved: false };
+      return;
+    }
     // Pen eraser end (button 5 / buttons 32) and the barrel button both erase.
     const erase = this.tool === 'eraser' || e.button === 5 || (e.buttons & 32) !== 0
       || (type === 'pen' && (e.button === 2 || (e.buttons & 2) !== 0));
     const p = this._pos(e);
     if (!this.inkVisible) this._showInk(true);
-    this.drawing = { id: e.pointerId, erase, x: p.x, y: p.y };
+    const lasso = !erase && this.tool === 'lasso';
+    this.drawing = { id: e.pointerId, erase, lasso, x: p.x, y: p.y, x0: p.x, y0: p.y };
+    clearTimeout(this.holdTimer);
+    this.holdTimer = setTimeout(() => this._longPress(), LONG_PRESS_MS);
     if (erase) {
       this.drawing.remaining = this.strokes;
       this._eraseTo(p.x, p.y);
@@ -527,10 +734,11 @@ export class Viewer {
       ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
-      ctx.strokeStyle = ctx.fillStyle = COLORS[this.color];
-      ctx.lineWidth = PEN_WIDTH_PX;
+      ctx.setLineDash(lasso ? [7, 7] : []);
+      ctx.strokeStyle = ctx.fillStyle = lasso ? '#111' : COLORS[this.color];
+      ctx.lineWidth = lasso ? 2 : PEN_WIDTH_PX;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, PEN_WIDTH_PX / 2, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, ctx.lineWidth / 2, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -544,11 +752,30 @@ export class Viewer {
     if (type === 'pen') this.penSeenAt = performance.now();
     const id = e.pointerId;
 
+    if (this.menuPointer === id) {
+      this.radial.track(e.clientX, e.clientY);
+      return;
+    }
+
+    if (this.pinPress?.id === id) {
+      const press = this.pinPress;
+      const p = this._pos(e);
+      // Pins stay put while ink is selected, so a tap-to-attach can't nudge one.
+      if (!press.moved && !this.selection && Math.hypot(p.x - press.x, p.y - press.y) > HOLD_SLOP_PX) press.moved = true;
+      if (press.moved) {
+        [press.pin.x, press.pin.y] = this._toPage(p.x, p.y).map(round2);
+        this._invalidate();
+      }
+      return;
+    }
+
     if (this.drawing?.id === id) {
       e.preventDefault();
+      const start = this.drawing;
       const batch = e.getCoalescedEvents?.() || [];
       for (const ev of batch.length ? batch : [e]) {
         const p = this._pos(ev);
+        if (Math.hypot(p.x - start.x0, p.y - start.y0) > HOLD_SLOP_PX) clearTimeout(this.holdTimer);
         if (this.drawing.erase) this._eraseTo(p.x, p.y); else this._inkTo(p.x, p.y);
       }
       return;
@@ -587,6 +814,22 @@ export class Viewer {
     const now = performance.now();
     if (this.ignored.delete(id)) return;
 
+    if (this.menuPointer === id) {
+      this.menuPointer = null;
+      if (e.pointerType === 'pen') this.penUpAt = this.penSeenAt = now;
+      if (cancelled) this.radial.close(); else this.radial.release(e.clientX, e.clientY);
+      return;
+    }
+
+    if (this.pinPress?.id === id) {
+      const press = this.pinPress;
+      this.pinPress = null;
+      if (e.pointerType === 'pen') this.penUpAt = this.penSeenAt = now;
+      if (press.moved) db.putPin(press.pin).catch((err) => this.onError(err, 'The pin was not saved'));
+      else if (!cancelled) this._tapPin(press.pin.id);
+      return;
+    }
+
     if (this.drawing?.id === id) {
       if (e.pointerType === 'pen') this.penUpAt = this.penSeenAt = now;
       this._finishStroke();
@@ -601,6 +844,7 @@ export class Viewer {
     // Double tap toggles between fit and a close-up of the tapped spot.
     const isTap = now - touch.t0 < 280 && Math.hypot(touch.x - touch.x0, touch.y - touch.y0) < 12;
     if (!isTap) { this.lastTap = null; return; }
+    if (touch.pinId) { this.lastTap = null; this._tapPin(touch.pinId); return; }
     const last = this.lastTap;
     if (last && now - last.t < 320 && Math.hypot(touch.x - last.x, touch.y - last.y) < 40) {
       this.lastTap = null;
@@ -669,8 +913,12 @@ export class Viewer {
   _finishStroke() {
     const d = this.drawing;
     this.drawing = null;
+    clearTimeout(this.holdTimer);
+    this.liveCtx.setLineDash([]);
     if (d.erase) {
       if (d.remaining !== this.strokes) this._commit(d.remaining);
+    } else if (d.lasso) {
+      this._lasso(d.pts);
     } else if (d.pts.length) {
       this._commit([...this.strokes, { c: COLORS[this.color], w: round2(d.width), p: d.pts }]);
     }
@@ -685,9 +933,13 @@ export class Viewer {
     const el = this.el;
     el.pens.forEach((btn, i) => {
       btn.style.setProperty('--ink', COLORS[i]);
-      btn.addEventListener('click', () => { this.tool = 'pen'; this.color = i; this._syncToolbar(); });
+      btn.addEventListener('click', () => { this.tool = 'pen'; this.color = i; this._setSelection(null); this._syncToolbar(); });
     });
-    el.eraser.addEventListener('click', () => { this.tool = 'eraser'; this._syncToolbar(); });
+    const pick = (tool) => { this.tool = tool; this._setSelection(null); this._syncToolbar(); };
+    el.eraser.addEventListener('click', () => pick('eraser'));
+    el.lasso.addEventListener('click', () => pick('lasso'));
+    el.lassoDetach.addEventListener('click', () => this._detach());
+    el.lassoCancel.addEventListener('click', () => this._setSelection(null));
     el.undo.addEventListener('click', () => this.undo());
     el.redo.addEventListener('click', () => this.redo());
     el.eye.addEventListener('click', () => this._showInk(!this.inkVisible));
@@ -701,7 +953,7 @@ export class Viewer {
       if (item) this.goto(Number(item.dataset.page));
     });
     window.addEventListener('keydown', (e) => {
-      if (!this.pdf || e.target.closest?.('input, textarea, dialog')) return;
+      if (!this.pdf || this.sheet.dlg.open || e.target.closest?.('input, textarea, select, dialog')) return;
       const mod = e.ctrlKey || e.metaKey;
       if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) this.redo(); else this.undo(); }
       else if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); this.redo(); }
@@ -716,6 +968,7 @@ export class Viewer {
     const h = this.history?.get(this.pageNum);
     el.pens.forEach((btn, i) => btn.setAttribute('aria-pressed', String(this.tool === 'pen' && this.color === i)));
     el.eraser.setAttribute('aria-pressed', String(this.tool === 'eraser'));
+    el.lasso.setAttribute('aria-pressed', String(this.tool === 'lasso'));
     el.eye.setAttribute('aria-pressed', String(!this.inkVisible));
     el.eye.querySelector('use').setAttribute('href', this.inkVisible ? '#i-eye' : '#i-eye-off');
     el.eye.setAttribute('aria-label', this.inkVisible ? 'Hide ink' : 'Show ink');
