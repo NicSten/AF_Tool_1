@@ -7,7 +7,7 @@ import { photoName } from './pins.js';
 import { TYPES, typeOf } from './types.js';
 import { safeName } from './ui.js';
 import { pathOf } from './viewer.js';
-import { strFromU8, strToU8, unzipSync, Zip, ZipDeflate, ZipPassThrough } from '../vendor/fflate/fflate.js';
+import { strFromU8, strToU8, Unzip, UnzipInflate, Zip, ZipDeflate, ZipPassThrough } from '../vendor/fflate/fflate.js';
 import * as PDF from '../vendor/pdf-lib/pdf-lib.esm.min.js';
 
 const BACKUP_FORMAT = 'af-field-backup';
@@ -18,28 +18,76 @@ const INDEX_PHOTO_PX = 1000;      // photos are downscaled for the index pages
 const pad = (n) => String(n).padStart(2, '0');
 const dateStamp = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const timeStamp = (d = new Date()) => `${dateStamp(d)}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+export const backupFileName = (name, d = new Date()) => `${safeName(name)}_backup_${timeStamp(d)}.zip`;
+export const exportFileName = (name, d = new Date()) => `${safeName(name)}_export_${dateStamp(d)}.zip`;
 
 // ---------------------------------------------------------------- zip
 
-// Streams entries into a Blob. PDFs and JPEGs are stored as-is (already compressed).
-function zipWriter() {
+// Stream output to a confirmed file, or temporary origin-private storage (OPFS).
+// Only browsers without OPFS need to keep the ZIP output chunks in memory.
+async function zipWriter(destination = null) {
+  let writable = destination, temporary = null;
+  if (!writable && navigator.storage?.getDirectory) {
+    try {
+      const directory = await navigator.storage.getDirectory();
+      const name = 'af-archive-' + db.newId() + '.zip';
+      const handle = await directory.getFileHandle(name, { create: true });
+      writable = await handle.createWritable();
+      temporary = { directory, name, handle };
+    } catch (err) {
+      console.warn('Temporary file storage unavailable; using Blob output.', err);
+    }
+  }
   const chunks = [];
-  let settle;
-  const finished = new Promise((resolve, reject) => { settle = { resolve, reject }; });
-  const zip = new Zip((err, chunk, final) => {
-    if (err) { settle.reject(err); return; }
-    chunks.push(chunk);
-    if (final) settle.resolve(new Blob(chunks, { type: 'application/zip' }));
+  let failure = null, queued = Promise.resolve();
+  let resolveFinished, rejectFinished;
+  const finished = new Promise((resolve, reject) => {
+    resolveFinished = resolve;
+    rejectFinished = reject;
   });
+  finished.catch(() => {});
+  const zip = new Zip((err, chunk, final) => {
+    if (err) { failure = err; rejectFinished(err); return; }
+    if (chunk?.length) {
+      if (writable) queued = queued.then(() => writable.write(chunk)).catch((e) => { failure = e; });
+      else chunks.push(chunk);
+    }
+    if (final) resolveFinished();
+  });
+  const cleanup = async () => {
+    if (temporary) {
+      try { await temporary.directory.removeEntry(temporary.name); }
+      catch (err) { console.warn('Could not remove temporary archive', err); }
+    }
+  };
   return {
-    add(name, data, compress = false) {
+    async add(name, data, compress = false) {
+      if (failure) throw failure;
+      if (!data) throw new Error('An archive file is missing: ' + name);
       const entry = compress ? new ZipDeflate(name, { level: 6 }) : new ZipPassThrough(name);
       zip.add(entry);
       entry.push(data instanceof Uint8Array ? data : new Uint8Array(data), true);
+      await queued; // backpressure: never queue hundreds of large photo writes
+      if (failure) throw failure;
     },
-    end() { zip.end(); return finished; },
+    async end() {
+      zip.end();
+      await finished;
+      await queued;
+      if (failure) throw failure;
+      if (writable) {
+        await writable.close(); // verified only after the file writer closes
+        return { blob: temporary ? await temporary.handle.getFile() : null, cleanup };
+      }
+      return { blob: new Blob(chunks, { type: 'application/zip' }), cleanup };
+    },
+    async abort() {
+      try { await writable?.abort?.(); } catch { /* already closed */ }
+      await cleanup();
+    },
   };
 }
+
 
 // Returns names that are unique within one folder ("E-101", "E-101 (2)", ...).
 function uniqueNamer() {
@@ -310,7 +358,7 @@ async function annotatedPdf(doc, project, inkByPage, pins, photoEntries, forceRa
 // ---------------------------------------------------------------- export
 
 // Builds the hand-off ZIP: csv/<Type>.csv, photos/<tag>_NN.jpg, pdf/<drawing>_annotated.pdf
-export async function exportProject(projectId, setStatus = () => {}, { forceRaster = false } = {}) {
+export async function exportProject(projectId, setStatus = () => {}, { forceRaster = false, writable = null } = {}) {
   const { project, docs, ink, pins, photos } = await db.dumpProject(projectId);
   pins.sort((a, b) => a.tag.localeCompare(b.tag, undefined, { numeric: true }));
   const docById = new Map(docs.map((d) => [d.id, d]));
@@ -321,12 +369,13 @@ export async function exportProject(projectId, setStatus = () => {}, { forceRast
     if (!photosByPin.has(photo.pinId)) photosByPin.set(photo.pinId, []);
     photosByPin.get(photo.pinId).push(photo);
   }
-  const zip = zipWriter();
+  const zip = await zipWriter(writable);
 
+  try {
   setStatus('Writing device tables…');
   for (const type of TYPES) {
     const ofType = pins.filter((p) => p.type === type.id);
-    if (ofType.length) zip.add(`csv/${type.label}.csv`, csvFor(ofType, docById, photosByPin), true);
+    if (ofType.length) await zip.add(`csv/${type.label}.csv`, csvFor(ofType, docById, photosByPin), true);
   }
 
   const photoEntries = (list) => list.flatMap((pin) => (photosByPin.get(pin.id) || []).map((photo) => ({
@@ -335,7 +384,7 @@ export async function exportProject(projectId, setStatus = () => {}, { forceRast
   const allPhotos = photoEntries(pins);
   for (const [i, entry] of allPhotos.entries()) {
     setStatus(`Adding photo ${i + 1} of ${allPhotos.length}…`);
-    zip.add(`photos/${entry.name}`, await entry.data());
+    await zip.add(`photos/${entry.name}`, await entry.data());
   }
 
   const unique = uniqueNamer();
@@ -344,18 +393,22 @@ export async function exportProject(projectId, setStatus = () => {}, { forceRast
     const inkByPage = new Map(ink.filter((e) => e.docId === doc.id).map((e) => [e.page, e.strokes]));
     const onDoc = pins.filter((p) => p.docId === doc.id);
     const bytes = await annotatedPdf(doc, project, inkByPage, onDoc, photoEntries(onDoc), forceRaster);
-    zip.add(`pdf/${unique(safeName(doc.name))}_annotated.pdf`, bytes);
+    await zip.add(`pdf/${unique(safeName(doc.name))}_annotated.pdf`, bytes);
   }
   // Photos of devices that are not pinned on any drawing get an index of their own.
   const loose = photoEntries(pins.filter((p) => !docById.has(p.docId)));
   if (loose.length) {
     const out = await PDF.PDFDocument.create();
     await addPhotoIndex(out, 'Photo index - devices not on a drawing', `${project.name}  ·  ${dateStamp()}`, loose);
-    zip.add('pdf/Devices not on a drawing_photo index.pdf', await out.save());
+    await zip.add('pdf/Devices not on a drawing_photo index.pdf', await out.save());
   }
 
   setStatus('Finishing ZIP…');
-  return { blob: await zip.end(), name: `${safeName(project.name)}_export_${dateStamp()}.zip` };
+  return { ...(await zip.end()), name: exportFileName(project.name) };
+  } catch (err) {
+    await zip.abort();
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------- backup / restore
@@ -363,58 +416,174 @@ export async function exportProject(projectId, setStatus = () => {}, { forceRast
 // One ZIP holding everything needed to rebuild the project on any tablet:
 //   backup.json  project, drawings, ink, pins, photo records, presets
 //   files/<docId>.pdf, thumbs/<docId>.jpg, photos/<photoId>.jpg
-export async function backupProject(projectId, setStatus = () => {}) {
+export async function backupProject(projectId, setStatus = () => {}, { writable = null, now = new Date() } = {}) {
   const data = await db.dumpProject(projectId);
-  const now = new Date();
-  data.project = { ...data.project, lastBackup: now.getTime() };
-  const zip = zipWriter();
-  zip.add('backup.json', strToU8(JSON.stringify({
-    format: BACKUP_FORMAT, version: BACKUP_VERSION, exported: now.toISOString(), ...data,
-  })), true);
-  for (const [i, doc] of data.docs.entries()) {
-    setStatus(`Backing up drawing ${i + 1} of ${data.docs.length}…`);
-    zip.add(`files/${doc.id}.pdf`, await db.getFile(doc.id));
-    const thumb = await db.getThumb(doc.id, 1);
-    if (thumb) zip.add(`thumbs/${doc.id}.jpg`, await thumb.arrayBuffer());
+  if (!data.project) throw new Error('This project no longer exists.');
+  const snapshotUpdated = data.project.updated;
+  data.project = { ...data.project, lastBackup: now.getTime(), backedUpThrough: snapshotUpdated };
+  const zip = await zipWriter(writable);
+  try {
+    await zip.add('backup.json', strToU8(JSON.stringify({
+      format: BACKUP_FORMAT, version: BACKUP_VERSION, exported: now.toISOString(), ...data,
+    })), true);
+    for (const [i, doc] of data.docs.entries()) {
+      setStatus('Backing up drawing ' + (i + 1) + ' of ' + data.docs.length + '…');
+      await zip.add('files/' + doc.id + '.pdf', await db.getFile(doc.id));
+      const thumb = await db.getThumb(doc.id, 1);
+      if (thumb) await zip.add('thumbs/' + doc.id + '.jpg', await thumb.arrayBuffer());
+    }
+    for (const [i, photo] of data.photos.entries()) {
+      setStatus('Backing up photo ' + (i + 1) + ' of ' + data.photos.length + '…');
+      await zip.add('photos/' + photo.id + '.jpg', await db.getPhotoData(photo.id));
+    }
+    setStatus('Finishing ZIP…');
+    return {
+      ...(await zip.end()), name: backupFileName(data.project.name, now),
+      time: now.getTime(), snapshotUpdated,
+    };
+  } catch (err) {
+    await zip.abort();
+    throw err;
   }
-  for (const [i, photo] of data.photos.entries()) {
-    setStatus(`Backing up photo ${i + 1} of ${data.photos.length}…`);
-    zip.add(`photos/${photo.id}.jpg`, await db.getPhotoData(photo.id));
-  }
-  setStatus('Finishing ZIP…');
-  return {
-    blob: await zip.end(),
-    name: `${safeName(data.project.name)}_backup_${timeStamp(now)}.zip`,
-    time: now.getTime(),
-  };
 }
 
-// Opens a backup ZIP and checks it before anything on the device is touched.
+
+// Validate the metadata before writing any device/project record.
+// A broken or unrelated ZIP produces an actionable error, not a TypeError.
+function validateBackup(data) {
+  if (!data || data.format !== BACKUP_FORMAT || !data.project?.id || typeof data.project.name !== 'string') {
+    throw new Error('That ZIP is not an AF Field backup.');
+  }
+  if (!Number.isInteger(data.version) || data.version < 1) throw new Error('Backup format version is missing or invalid.');
+  if (data.version > BACKUP_VERSION) throw new Error('This backup is from a newer app version. Update the app first.');
+  if (!Number.isFinite(data.project.updated)) throw new Error('Backup has invalid project metadata.');
+  for (const field of ['docs', 'ink', 'pins', 'photos', 'presets']) {
+    if (!Array.isArray(data[field])) throw new Error('Backup metadata is invalid: missing ' + field + ' list.');
+  }
+  const idOK = (id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
+  if (!idOK(data.project.id)) throw new Error('Backup contains an invalid project ID.');
+  for (const doc of data.docs) {
+    if (!idOK(doc?.id) || typeof doc.name !== 'string' || doc.projectId !== data.project.id)
+      throw new Error('Backup contains an invalid drawing record.');
+  }
+  for (const photo of data.photos) {
+    if (!idOK(photo?.id) || !idOK(photo.pinId) || photo.projectId !== data.project.id)
+      throw new Error('Backup contains an invalid photo record.');
+  }
+  for (const pin of data.pins) {
+    if (!idOK(pin?.id) || pin.projectId !== data.project.id || !Array.isArray(pin.fields))
+      throw new Error('Backup contains an invalid device record.');
+  }
+  for (const entry of data.ink) {
+    if (!idOK(entry?.docId) || !Number.isInteger(entry.page) || !Array.isArray(entry.strokes))
+      throw new Error('Backup contains an invalid ink record.');
+  }
+  for (const preset of data.presets) if (!idOK(preset?.id))
+    throw new Error('Backup contains an invalid preset.');
+  const required = new Set(['backup.json']);
+  const allowed = new Set(required);
+  for (const doc of data.docs) {
+    required.add('files/' + doc.id + '.pdf');
+    allowed.add('thumbs/' + doc.id + '.jpg');
+  }
+  for (const photo of data.photos) required.add('photos/' + photo.id + '.jpg');
+  for (const name of required) allowed.add(name);
+  return { required, allowed };
+}
+
+// Unzip incrementally. Store one finished PDF/photo at a time in a temporary
+// IndexedDB store instead of retaining the entire expanded archive in RAM.
 export async function readBackup(file) {
-  let entries;
+  const stageId = db.newId();
+  const seen = new Set();
+  const pending = [];
+  let data = null, manifest = null, failure = null, started = false;
+  const unzip = new Unzip((entry) => {
+    if (failure) return;
+    const name = entry.name;
+    if (!started && name !== 'backup.json') {
+      failure = new Error('Invalid backup: backup.json must be the first ZIP entry.');
+      return;
+    }
+    started = true;
+    if (seen.has(name) || (data && !manifest.allowed.has(name)) || (!data && name !== 'backup.json')) {
+      failure = new Error('Invalid backup: unexpected or repeated archive file ' + name);
+      return;
+    }
+    const chunks = [];
+    let length = 0;
+    entry.ondata = (err, bytes, final) => {
+      if (err) { failure = new Error('Could not decompress ' + name); return; }
+      if (failure) return;
+      if (bytes?.length) {
+        length += bytes.length;
+        if (name === 'backup.json' && length > 32 * 1024 * 1024) {
+          failure = new Error('Backup metadata is unreasonably large.');
+          return;
+        }
+        chunks.push(bytes.slice());
+      }
+      if (!final) return;
+      const output = new Uint8Array(length);
+      let offset = 0;
+      for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.length; }
+      if (name === 'backup.json') {
+        try { data = JSON.parse(strFromU8(output)); }
+        catch { failure = new Error('Backup metadata (backup.json) contains invalid JSON.'); return; }
+        try { manifest = validateBackup(data); }
+        catch (e) { failure = e; return; }
+      } else {
+        const m = /^(files|photos|thumbs)\/([A-Za-z0-9_-]+)\.(pdf|jpg)$/.exec(name);
+        if (!m) { failure = new Error('Backup has an invalid archive path.'); return; }
+        const [, kind, id] = m;
+        const value = kind === 'thumbs' ? new Blob([output], { type: 'image/jpeg' }) : output.buffer;
+        pending.push(db.stageRestoreEntry(stageId, kind, id, value));
+      }
+      seen.add(name);
+    };
+    entry.start();
+  });
+  unzip.register(UnzipInflate);
   try {
-    entries = unzipSync(new Uint8Array(await file.arrayBuffer()));
-  } catch {
+    // File.stream() reads only small chunks; never file.arrayBuffer() on tablet.
+    if (!file.stream) throw new Error('This browser cannot stream ZIP files.');
+    const reader = file.stream().getReader();
+    let count = 0;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        unzip.push(value, false);
+        if (pending.length) await Promise.all(pending.splice(0));
+        if (failure) throw failure;
+        if (++count % 8 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      unzip.push(new Uint8Array(0), true);
+      if (pending.length) await Promise.all(pending.splice(0));
+      if (failure) throw failure;
+    } finally {
+      reader.releaseLock();
+    }
+    if (!data) throw new Error('That ZIP is not an AF Field backup (export ZIPs cannot be restored).');
+    for (const name of manifest.required) {
+      if (!seen.has(name)) throw new Error('Backup is incomplete: missing ' + name);
+    }
+    return { data, stageId };
+  } catch (err) {
+    await Promise.allSettled(pending);
+    await db.clearRestoreStaging(stageId);
+    if (err instanceof Error) throw err;
     throw new Error('That file is not a readable ZIP.');
   }
-  if (!entries['backup.json']) throw new Error('That ZIP is not an AF Field backup (an export ZIP cannot be restored).');
-  const data = JSON.parse(strFromU8(entries['backup.json']));
-  if (data.format !== BACKUP_FORMAT || !data.project?.id) throw new Error('That ZIP is not an AF Field backup.');
-  if (data.version > BACKUP_VERSION) throw new Error('This backup was made by a newer version of the app. Update the app first.');
-  for (const doc of data.docs) if (!entries[`files/${doc.id}.pdf`]) throw new Error(`The backup is incomplete: “${doc.name}” is missing.`);
-  for (const photo of data.photos) if (!entries[`photos/${photo.id}.jpg`]) throw new Error('The backup is incomplete: a photo is missing.');
-  return { data, entries };
 }
 
-export async function restoreBackup({ data, entries }) {
-  const own = (u8) => (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength ? u8.buffer : u8.slice().buffer);
-  const files = new Map(data.docs.map((d) => [d.id, own(entries[`files/${d.id}.pdf`])]));
-  const photoData = new Map(data.photos.map((p) => [p.id, own(entries[`photos/${p.id}.jpg`])]));
-  const thumbs = new Map();
-  for (const doc of data.docs) {
-    const thumb = entries[`thumbs/${doc.id}.jpg`];
-    if (thumb) thumbs.set(doc.id, new Blob([thumb], { type: 'image/jpeg' }));
+export async function restoreBackup({ data, stageId }) {
+  try {
+    await db.restoreProject(data, { stageId });
+    return data.project;
+  } finally {
+    await db.clearRestoreStaging(stageId);
   }
-  await db.restoreProject(data, { files, photoData, thumbs });
-  return data.project;
 }
+
+ and checks it before anything on the device is touched.
