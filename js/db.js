@@ -17,7 +17,7 @@
 import { DEFAULT_PRESETS } from './types.js';
 
 const DB_NAME = 'af-field';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 let dbPromise;
 
@@ -45,6 +45,7 @@ function openDb() {
           const presets = db.createObjectStore('presets', { keyPath: 'id' });
           DEFAULT_PRESETS.forEach((p) => presets.put(p));
         }
+        if (e.oldVersion < 3) db.createObjectStore('restoreStaging');
       };
       req.onsuccess = () => {
         req.result.onversionchange = () => req.result.close();
@@ -80,7 +81,7 @@ const req = (r) => new Promise((resolve, reject) => {
 export const newId = () => (crypto.randomUUID ? crypto.randomUUID()
   : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
 
-const docRange = (docId) => IDBKeyRange.bound([docId, 0], [docId, Infinity]);
+const docRange = (docId) => IDBKeyRange.bound([docId, 0], [docId, Number.MAX_SAFE_INTEGER]);
 
 // ---- projects ----
 
@@ -139,18 +140,18 @@ export function touchProject(id) {
   });
 }
 
-export function setBackedUp(id, time) {
+// Mark only the revision captured in the saved archive, not edits made while it was built.
+export function setBackedUp(id, time, snapshotUpdated) {
   return tx('projects', 'readwrite', async (s) => {
     const p = await req(s.get(id));
-    if (p) s.put({ ...p, lastBackup: time });
+    if (p) s.put({ ...p, lastBackup: time, backedUpThrough: snapshotUpdated });
   });
 }
 
-// True when the project has changes that are not in a backup and no backup was made today.
+// Every change made after the latest confirmed backup requires a new backup.
+// Old projects without backedUpThrough use the prior timestamp for compatibility.
 export function needsBackup(project) {
-  const last = project.lastBackup || 0;
-  if (project.updated <= last) return false;
-  return new Date(last).toDateString() !== new Date().toDateString();
+  return project.updated > (project.backedUpThrough ?? project.lastBackup ?? 0);
 }
 
 // ---- documents ----
@@ -341,25 +342,65 @@ export function dumpProject(projectId) {
     });
 }
 
-// Writes a dumped project back. `files`, `photoData` and `thumbs` map ids to binary data.
-// Presets that already exist on this device are left as they are.
-export async function restoreProject(data, { files, photoData, thumbs }) {
-  await deleteProject(data.project.id);
-  return tx(['projects', 'docs', 'files', 'ink', 'thumbs', 'pins', 'photos', 'photoData', 'presets'], 'readwrite',
-    async (projects, docs, fileStore, ink, thumbStore, pins, photos, photoStore, presets) => {
-      projects.put(data.project);
-      for (const doc of data.docs) {
-        docs.put(doc);
-        fileStore.put(files.get(doc.id), doc.id);
-        if (thumbs.has(doc.id)) thumbStore.put(thumbs.get(doc.id), [doc.id, 1]);
+// Stage incoming archive files separately before modifying an existing project.
+// Each file is held only briefly in RAM; the staging store persists between chunks.
+export function stageRestoreEntry(session, kind, id, bytes) {
+  return tx('restoreStaging', 'readwrite', (s) => req(s.put(bytes, [session, kind, id])));
+}
+
+const stagedRange = (session) => IDBKeyRange.bound([session], [session, '\uffff']);
+
+export function clearRestoreStaging(session) {
+  return tx('restoreStaging', 'readwrite', async (s) => {
+    for (const key of await req(s.getAllKeys(stagedRange(session)))) s.delete(key);
+  });
+}
+
+// Replace a project atomically: every delete and every insertion participates in
+// the SAME transaction. Quota errors abort the entire replacement, preserving
+// the old project. Staged file bytes are read from IndexedDB inside this tx,
+// never asynchronously fetched from File/OPFS after the transaction begins.
+export function restoreProject(data, { stageId }) {
+  if (!stageId) throw new Error('Restore requires staged archive data.');
+  return tx(['projects', 'docs', 'files', 'ink', 'thumbs', 'pins', 'photos', 'photoData', 'presets', 'restoreStaging'],
+    'readwrite', async (projects, docs, fileStore, ink, thumbStore, pins, photos, photoStore, presets, staging) => {
+      const id = data.project.id;
+      const [docIds, pinIds, photoIds] = await Promise.all([
+        req(docs.index('projectId').getAllKeys(id)),
+        req(pins.index('projectId').getAllKeys(id)),
+        req(photos.index('projectId').getAllKeys(id)),
+      ]);
+      for (const docId of docIds) {
+        docs.delete(docId);
+        fileStore.delete(docId);
+        ink.delete(docRange(docId));
+        thumbStore.delete(docRange(docId));
       }
-      data.ink.forEach((entry) => ink.put(entry.strokes, [entry.docId, entry.page]));
-      data.pins.forEach((pin) => pins.put(pin));
+      for (const pinId of pinIds) pins.delete(pinId);
+      for (const photoId of photoIds) {
+        photos.delete(photoId);
+        photoStore.delete(photoId);
+      }
+      projects.put(data.project);
+
+      for (const doc of data.docs) {
+        const binary = await req(staging.get([stageId, 'files', doc.id]));
+        if (!binary) throw new Error(`Restore data is missing drawing “${doc.name}”.`);
+        docs.put(doc);
+        fileStore.put(binary, doc.id);
+        const thumb = await req(staging.get([stageId, 'thumbs', doc.id]));
+        if (thumb) thumbStore.put(thumb, [doc.id, 1]);
+      }
+      for (const entry of data.ink) ink.put(entry.strokes, [entry.docId, entry.page]);
+      for (const pin of data.pins) pins.put(pin);
       for (const photo of data.photos) {
+        const binary = await req(staging.get([stageId, 'photos', photo.id]));
+        if (!binary) throw new Error('Restore data is missing a photo.');
         photos.put(photo);
-        photoStore.put(photoData.get(photo.id), photo.id);
+        photoStore.put(binary, photo.id);
       }
       const have = new Set(await req(presets.getAllKeys()));
-      data.presets.filter((p) => !have.has(p.id)).forEach((p) => presets.put(p));
+      for (const preset of data.presets) if (!have.has(preset.id)) presets.put(preset);
+      for (const key of await req(staging.getAllKeys(stagedRange(stageId)))) staging.delete(key);
     });
 }

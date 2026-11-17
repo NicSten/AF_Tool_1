@@ -5,7 +5,7 @@ import * as db from './db.js';
 import { closePdf, openPdf, renderThumb } from './pdf.js';
 import { createPin, missingFields, PinSheet } from './pins.js';
 import { TYPES, typeOf } from './types.js';
-import { busy, dialog, download, esc, plural, showError, toast } from './ui.js';
+import { busy, dialog, esc, offerFile, plural, safeName, showError, toast } from './ui.js';
 import { Viewer } from './viewer.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -53,7 +53,7 @@ async function showProjects() {
 function backupWarning(project, contentCount) {
   if (!contentCount || !db.needsBackup(project)) return '';
   return project.lastBackup
-    ? `Not backed up today — last backup ${fmtDateTime(project.lastBackup)}`
+    ? `Changes since last backup (${fmtDateTime(project.lastBackup)})`
     : 'Never backed up';
 }
 
@@ -90,18 +90,23 @@ $('#restore-input').addEventListener('change', guard(async (e) => {
   if (!file) return;
   const { readBackup, restoreBackup } = await import('./exporter.js');
   const backup = await busy('Reading backup…', () => readBackup(file));
-  const { project, docs, pins, exported } = backup.data;
-  const existing = await db.getProject(project.id);
-  const summary = `${plural(docs.length, 'drawing')} and ${plural(pins.length, 'device')}, backed up ${fmtDateTime(exported)}.`;
-  const yes = await dialog(existing ? {
-    title: `Replace “${existing.name}”?`,
-    body: `This project is already on this tablet. Restoring replaces it with the backup: ${summary} Anything added since that backup will be lost.`,
-    ok: 'Replace', danger: true,
-  } : { title: `Restore “${project.name}”?`, body: `The backup holds ${summary}`, ok: 'Restore' });
-  if (!yes) return;
-  await busy('Restoring…', () => restoreBackup(backup));
-  toast(`“${project.name}” restored`);
-  showProjects();
+  try {
+    const { project, docs, pins, exported } = backup.data;
+    const existing = await db.getProject(project.id);
+    const summary = `${plural(docs.length, 'drawing')} and ${plural(pins.length, 'device')}, backed up ${fmtDateTime(exported)}.`;
+    const yes = await dialog(existing ? {
+      title: `Replace “${existing.name}”?`,
+      body: `This project is already on this tablet. Restoring replaces it with the backup: ${summary} Anything added since that backup will be lost.`,
+      ok: 'Replace', danger: true,
+    } : { title: `Restore “${project.name}”?`, body: `The backup holds ${summary}`, ok: 'Restore' });
+    if (!yes) return;
+    await busy('Restoring…', () => restoreBackup(backup));
+    toast(`“${project.name}” restored`);
+    showProjects();
+  } finally {
+    // Cancelled restores and failed confirmations must not consume storage.
+    await db.clearRestoreStaging(backup.stageId);
+  }
 }));
 
 // ---------------------------------------------------------------- project (drawings) screen
@@ -205,26 +210,83 @@ $('#doc-list').addEventListener('click', guard(async (e) => {
 
 // ---- export & backup
 
+// The native save picker must be requested directly from the button gesture,
+// before PDF processing or an awaited import causes activation to expire.
+async function directFileWriter(name) {
+  if (!window.showSaveFilePicker) return { writable: null };
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: name,
+      types: [{ description: 'ZIP archive', accept: { 'application/zip': ['.zip'] } }],
+    });
+    return { writable: await handle.createWritable() };
+  } catch (err) {
+    if (err?.name === 'AbortError') return { cancelled: true };
+    throw err;
+  }
+}
+
+// OPFS output files can be removed when the user is finished. For a normal
+// browser download, retain the File snapshot while the download starts.
+async function releaseArchive(result, delivery) {
+  if (delivery === 'download') {
+    setTimeout(() => result.cleanup?.(), 120000);
+  } else {
+    await result.cleanup?.();
+  }
+}
+
 $('#btn-export').addEventListener('click', guard(async () => {
   const project = currentProject;
+  const { writable, cancelled } = await directFileWriter(safeName(project.name) + '_export.zip');
+  if (cancelled) return;
   const result = await busy('Preparing export…', async (setStatus) => {
     const { exportProject } = await import('./exporter.js');
-    return exportProject(project.id, setStatus);
+    return exportProject(project.id, setStatus, { writable });
   });
-  download(result.blob, result.name);
-  toast(`Export saved to Downloads: ${result.name}`);
+  let delivery = 'saved';
+  try {
+    if (!writable) delivery = await offerFile(result.blob, result.name);
+    if (delivery === 'saved') toast('Export file saved.');
+    else if (delivery === 'share') toast('Archive handed to the selected app.');
+    else if (delivery === 'download') toast('Download started; check that the file appears in Downloads.');
+  } finally {
+    await releaseArchive(result, delivery);
+  }
 }));
 
 const backupNow = guard(async () => {
   const project = currentProject;
+  const { writable, cancelled } = await directFileWriter(safeName(project.name) + '_backup.zip');
+  if (cancelled) return;
   const result = await busy('Preparing backup…', async (setStatus) => {
     const { backupProject } = await import('./exporter.js');
-    return backupProject(project.id, setStatus);
+    return backupProject(project.id, setStatus, { writable });
   });
-  download(result.blob, result.name);
-  await db.setBackedUp(project.id, result.time);
-  toast(`Backup saved to Downloads: ${result.name}`);
-  if (currentProject === project && route().view === 'project') showProject(project.id);
+  let delivery = 'saved', verified = !!writable;
+  try {
+    if (!writable) {
+      delivery = await offerFile(result.blob, result.name);
+      if (delivery) {
+        verified = !!(await dialog({
+          title: 'Confirm the backup was saved',
+          body: delivery === 'download'
+            ? 'Check that the ZIP is present in Downloads before confirming. The browser cannot verify that a download completed.'
+            : 'Confirm that your selected app saved or transferred the ZIP successfully. Sharing alone does not guarantee a durable copy.',
+          ok: 'I verified the file',
+        }));
+      }
+    }
+    if (verified) {
+      await db.setBackedUp(project.id, result.time, result.snapshotUpdated);
+      toast('Backup verified: ' + result.name);
+    } else {
+      toast('Backup warning remains until a saved copy is verified.', true);
+    }
+    if (currentProject === project && route().view === 'project') showProject(project.id);
+  } finally {
+    await releaseArchive(result, delivery);
+  }
 });
 $('#btn-backup').addEventListener('click', backupNow);
 $('#btn-backup-now').addEventListener('click', backupNow);
